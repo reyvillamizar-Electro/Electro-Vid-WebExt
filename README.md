@@ -1,26 +1,28 @@
 # Electro Vid-WebExt
 
-Aplicación de escritorio para detectar fuentes de video expuestas por páginas web y abrirlas de forma independiente.
+Aplicación de escritorio para detectar, inspeccionar y previsualizar fuentes de video expuestas por páginas web.
 
 ## Estado actual
 
-La primera versión incluye:
+La aplicación incluye:
 
 - interfaz gráfica con PySide6;
 - campo para pegar una URL;
 - análisis en segundo plano para no congelar la interfaz;
 - detección de elementos `<video>`, `<source>`, metadatos OpenGraph y enlaces directos;
 - reconocimiento de MP4, WebM, HLS (`.m3u8`), DASH (`.mpd`), MOV y M4V;
-- tabla de resultados;
+- tabla con tipo, duración, calidad, tamaño, origen y URL;
+- pestaña interna de previsualización;
+- controles de reproducir, pausar, detener y desplazarse por el video;
 - acciones para abrir una fuente o copiar su URL.
 
-Esta versión analiza el HTML entregado directamente por el servidor. La siguiente etapa añadirá un navegador embebido con QtWebEngine e inspección de tráfico para detectar reproductores y streams creados dinámicamente con JavaScript.
+## Metadatos
 
-## Requisitos
+- **Tamaño:** se intenta obtener mediante encabezados HTTP.
+- **Calidad:** se obtiene con `ffprobe` cuando está disponible; si no, también se intenta inferir desde nombres como `720p`, `1080p` o `1920x1080`.
+- **Duración:** se obtiene con `ffprobe` cuando está disponible.
 
-- Windows 10/11
-- Python 3.14
-- uv
+En streams HLS/DASH puede no existir un tamaño único porque el video se entrega en segmentos.
 
 ## Ejecutar
 
@@ -30,22 +32,19 @@ uv sync
 uv run main.py
 ```
 
-## Estructura
+## ffprobe opcional
 
-```text
-Electro-Vid-WebExt/
-├── main.py
-├── pyproject.toml
-├── electro_vid_webext/
-│   ├── __init__.py
-│   ├── core/
-│   │   ├── __init__.py
-│   │   └── detector.py
-│   └── ui/
-│       ├── __init__.py
-│       └── main_window.py
-└── README.md
+La aplicación funciona sin `ffprobe`, pero para obtener duración y resolución de forma más fiable conviene tener FFmpeg instalado y `ffprobe` disponible en el PATH de Windows.
+
+Puedes comprobarlo con:
+
+```powershell
+ffprobe -version
 ```
+
+## Próxima etapa
+
+La siguiente fase incorporará QtWebEngine e inspección de tráfico para detectar fuentes creadas dinámicamente por JavaScript, incluyendo casos con `blob:`, HLS y DASH.
 
 ## Uso responsable
 
