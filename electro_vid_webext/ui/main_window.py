@@ -587,7 +587,6 @@ class MainWindow(QMainWindow):
                 return row
         return None
 
-    @Slot()
     def _apply_table_filter(self, *_args) -> None:
         if not hasattr(self, "filter_input"):
             return
