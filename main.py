@@ -9,7 +9,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Electro Vid-WebExt")
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     return app.exec()
 
 
