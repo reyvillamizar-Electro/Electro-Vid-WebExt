@@ -1,7 +1,9 @@
 [project]
 name = "electro-vid-webext"
 version = "0.1.0"
-description = "Add your description here"
+description = "Desktop tool to detect and isolate web video sources."
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "pyside6>=6.11.2",
+]
