@@ -8,7 +8,10 @@ Aplicación de escritorio para detectar, inspeccionar, previsualizar y descargar
 - inicio maximizado y diseño adaptable al área útil de Windows;
 - detección de elementos `<video>`, `<source>`, OpenGraph y enlaces directos;
 - MP4, WebM, HLS (`.m3u8`), DASH (`.mpd`), MOV y M4V;
-- tabla con tipo, duración, calidad, codec, tamaño, origen y URL;
+- tabla con tipo, duración, calidad, resolución exacta, codec, tamaño, origen y URL;
+- filtro global o por columna;
+- ordenamiento al hacer clic en cualquier encabezado;
+- columnas redimensionables manualmente y desplazamiento horizontal;
 - metadatos concurrentes mediante FFprobe;
 - reproducción integrada con mpv;
 - aceleración por hardware segura con fallback por software;
@@ -83,9 +86,11 @@ uv sync
 uv run main.py
 ```
 
-## Próxima etapa
+## Detección dinámica
 
-La siguiente fase incorporará QtWebEngine e inspección de tráfico para detectar fuentes creadas dinámicamente por JavaScript, incluidos reproductores con `blob:`, HLS y DASH.
+La aplicación incorpora QtWebEngine en la pestaña **Navegador**. Al cargar o reproducir contenido dentro de esa pestaña, inspecciona solicitudes de red y el DOM para incorporar nuevas fuentes MP4, WebM, HLS y DASH a la tabla de resultados sin duplicados.
+
+Esto permite encontrar fuentes y variantes que no están presentes en el HTML inicial. Los enlaces `blob:` no se descargan directamente; se intenta detectar la fuente de red subyacente.
 
 ## Uso responsable
 
