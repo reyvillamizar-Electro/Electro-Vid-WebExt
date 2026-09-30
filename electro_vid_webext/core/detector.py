@@ -50,7 +50,7 @@ class _MediaHTMLParser(HTMLParser):
                     self.candidates.append((values["content"], f"<meta {prop}>"))
 
 
-def mediamedia_kind_from_url(url: str) -> str | None:
+def media_kind_from_url(url: str) -> str | None:
     path = urlparse(url).path.lower()
     for extension, kind in MEDIA_EXTENSIONS.items():
         if path.endswith(extension):
