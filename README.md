@@ -1,64 +1,79 @@
 # Electro Vid-WebExt
 
-Aplicación de escritorio para detectar, inspeccionar y previsualizar fuentes de video expuestas por páginas web.
+Aplicación de escritorio para detectar, inspeccionar, previsualizar y descargar fuentes de video expuestas por páginas web.
 
-## Estado actual
-
-La aplicación incluye:
+## Funciones actuales
 
 - interfaz gráfica con PySide6;
-- inicio maximizado;
-- campo para pegar una URL;
-- análisis en segundo plano para no congelar la interfaz;
-- detección de elementos `<video>`, `<source>`, metadatos OpenGraph y enlaces directos;
-- reconocimiento de MP4, WebM, HLS (`.m3u8`), DASH (`.mpd`), MOV y M4V;
-- tabla con tipo, duración, calidad, **codec**, tamaño, origen y URL;
-- análisis concurrente de metadatos;
-- pestaña interna de previsualización;
-- reproducción mediante **mpv**;
-- controles de reproducir/pausar, detener y desplazarse por el video;
-- acciones para abrir una fuente o copiar su URL.
+- inicio maximizado y diseño adaptable al área útil de Windows;
+- detección de elementos `<video>`, `<source>`, OpenGraph y enlaces directos;
+- MP4, WebM, HLS (`.m3u8`), DASH (`.mpd`), MOV y M4V;
+- tabla con tipo, duración, calidad, codec, tamaño, origen y URL;
+- metadatos concurrentes mediante FFprobe;
+- reproducción integrada con mpv;
+- aceleración por hardware segura con fallback por software;
+- reproducir/pausar, detener y desplazamiento temporal;
+- volumen y silencio;
+- repetición completa del video;
+- bucle A–B entre dos puntos elegidos por el usuario;
+- modo de pantalla completa con salida mediante Escape;
+- descarga de archivos directos;
+- descarga de HLS/DASH mediante FFmpeg cuando la fuente es accesible;
+- abrir fuente y copiar URL.
 
-## Motor de reproducción
+## Reproductor mpv
 
-Electro Vid-WebExt usa **mpv** para la previsualización en lugar de Qt Multimedia.
+Electro Vid-WebExt usa mpv como motor de reproducción.
 
-Se inicia con una configuración orientada a compatibilidad:
+La configuración prioriza compatibilidad:
 
-- `hwdec=auto-safe`: intenta aceleración por hardware solo cuando es segura;
-- si un codec como AV1, HEVC o VP9 no puede decodificarse por GPU, mpv puede recurrir a decodificación por software;
-- `gpu-api=auto`: deja que mpv elija el backend gráfico apropiado;
-- `vd-lavc-dr=no`: evita algunos problemas de direct rendering entre decodificadores y drivers.
+- `hwdec=auto-safe`;
+- `gpu-api=auto`;
+- `vo=gpu-next`;
+- `vd-lavc-dr=no`.
 
-Esto reduce los problemas que pueden aparecer cuando Windows intenta forzar D3D11 para un codec no soportado por la GPU.
+Si la GPU no soporta AV1, HEVC, VP9 u otro codec mediante hardware, mpv puede recurrir a decodificación por software.
 
-## Metadatos
+La aplicación busca `mpv.exe` tanto en el PATH como en ubicaciones comunes de Windows, incluyendo:
 
-FFprobe se utiliza para obtener:
+```text
+C:\Program Files\MPV Player\mpv.exe
+```
 
-- duración;
-- resolución real;
-- codec de video, por ejemplo H.264/AVC, H.265/HEVC, AV1, VP9;
-- la aplicación intenta además obtener el tamaño mediante los encabezados HTTP.
+## Bucle A–B
 
-En HLS/DASH puede no existir un tamaño único porque el contenido se entrega en segmentos.
+Durante la reproducción:
+
+1. pulsa **A** en el punto inicial;
+2. avanza hasta el punto final;
+3. pulsa **B**;
+4. mpv repetirá únicamente ese intervalo;
+5. **A–B ✕** elimina el bucle.
+
+El botón **Bucle** repite el archivo completo.
+
+## Descargas
+
+Para MP4, WebM, MOV y M4V accesibles directamente, la aplicación descarga el archivo por HTTP.
+
+Para HLS y DASH utiliza FFmpeg con copia de streams cuando es posible.
+
+La disponibilidad de descarga depende de cómo el servidor publique la fuente. La aplicación no intenta eludir DRM, autenticación ni controles de acceso.
 
 ## Requisitos
 
 - Windows 10/11
 - Python 3.14
 - uv
-- FFmpeg / ffprobe
+- FFmpeg / FFprobe
 - mpv
 
-Comprueba las herramientas con:
+Comprobación:
 
 ```powershell
 ffprobe -version
-mpv --version
+& "C:\Program Files\MPV Player\mpv.exe" --version
 ```
-
-Si `mpv --version` no funciona, la aplicación seguirá pudiendo analizar videos y leer metadatos, pero la pestaña de previsualización avisará que falta mpv.
 
 ## Ejecutar
 
@@ -70,8 +85,8 @@ uv run main.py
 
 ## Próxima etapa
 
-La siguiente fase incorporará QtWebEngine e inspección de tráfico para detectar fuentes creadas dinámicamente por JavaScript, incluyendo casos con `blob:`, HLS y DASH.
+La siguiente fase incorporará QtWebEngine e inspección de tráfico para detectar fuentes creadas dinámicamente por JavaScript, incluidos reproductores con `blob:`, HLS y DASH.
 
 ## Uso responsable
 
-La herramienta está pensada para analizar fuentes multimedia accesibles normalmente por el navegador. No intenta eludir DRM, controles de acceso ni protecciones de servicios.
+La herramienta está pensada para trabajar con fuentes multimedia accesibles normalmente por el navegador y para contenido que el usuario tenga permiso de reproducir o guardar. No intenta eludir DRM ni controles de acceso.
