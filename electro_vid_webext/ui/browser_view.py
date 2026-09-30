@@ -41,7 +41,7 @@ class BrowserView(QWebEngineView):
         super().__init__(parent)
 
         self.interceptor = MediaRequestInterceptor(self)
-        self.interceptor.media_found.connect(self.media_found)
+        self.interceptor.media_found.connect(self.media_found.emit)
 
         profile = QWebEngineProfile.defaultProfile()
         profile.setUrlRequestInterceptor(self.interceptor)
