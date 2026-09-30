@@ -5,7 +5,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 ProgressCallback = Callable[[int], None]
@@ -66,6 +66,61 @@ def _headers(referer: str | None) -> dict[str, str]:
         headers["Referer"] = referer
     return headers
 
+
+
+def _select_best_hls_variant(url: str, referer: str | None) -> str:
+    """Return the highest-quality variant from an HLS master playlist when possible."""
+    if not urlparse(url).path.lower().endswith(".m3u8"):
+        return url
+
+    request = Request(url, headers=_headers(referer))
+    try:
+        with urlopen(request, timeout=15) as response:
+            text = response.read(2 * 1024 * 1024).decode("utf-8", errors="replace")
+    except Exception:
+        return url
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    variants: list[tuple[int, int, str]] = []
+
+    for index, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+
+        attrs = line.split(":", 1)[1]
+        bandwidth = 0
+        width = 0
+        height = 0
+
+        for part in attrs.split(","):
+            key, _, value = part.partition("=")
+            key = key.strip().upper()
+            value = value.strip().strip('"')
+
+            if key in {"BANDWIDTH", "AVERAGE-BANDWIDTH"} and value.isdigit():
+                bandwidth = max(bandwidth, int(value))
+            elif key == "RESOLUTION" and "x" in value.lower():
+                left, right = value.lower().split("x", 1)
+                if left.isdigit() and right.isdigit():
+                    width = int(left)
+                    height = int(right)
+
+        variant_url = None
+        for following in lines[index + 1:]:
+            if following.startswith("#"):
+                continue
+            variant_url = urljoin(url, following)
+            break
+
+        if variant_url:
+            pixels = width * height
+            variants.append((pixels, bandwidth, variant_url))
+
+    if not variants:
+        return url
+
+    variants.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return variants[0][2]
 
 def _temporary_target(destination: str) -> Path:
     target = Path(destination)
@@ -186,6 +241,8 @@ def _download_with_ffmpeg(
     if progress:
         progress(-1)
 
+    source_url = _select_best_hls_variant(url, referer)
+
     command = [
         ffmpeg,
         "-hide_banner",
@@ -201,11 +258,11 @@ def _download_with_ffmpeg(
     command.extend(
         [
             "-i",
-            url,
+            source_url,
             "-map",
-            "0:v?",
+            "0:v:0?",
             "-map",
-            "0:a?",
+            "0:a:0?",
             "-c",
             "copy",
             str(temp_target),
