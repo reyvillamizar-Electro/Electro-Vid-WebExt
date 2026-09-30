@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QStandardPaths, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QTabWidget,
     QTableWidget,
@@ -22,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from electro_vid_webext.core.detector import VideoSource, detect_video_sources
+from electro_vid_webext.core.downloader import download_media, suggested_extension
 from electro_vid_webext.core.metadata import MediaMetadata, ffprobe_available, read_media_metadata
 from electro_vid_webext.core.mpv_player import MPVController, MPVError
 
@@ -80,24 +86,59 @@ class MetadataWorker(QObject):
         self.finished.emit()
 
 
+class DownloadWorker(QObject):
+    progress = Signal(int)
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, url: str, destination: str, kind: str) -> None:
+        super().__init__()
+        self.url = url
+        self.destination = destination
+        self.kind = kind
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            download_media(
+                self.url,
+                self.destination,
+                self.kind,
+                progress=self.progress.emit,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(self.destination)
+
+
 class MainWindow(QMainWindow):
+    KIND_COLUMN = 0
     URL_COLUMN = 6
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Electro Vid-WebExt")
-        self.resize(1280, 760)
+        self.resize(1180, 680)
+        self.setMinimumSize(760, 480)
 
         self._analysis_thread: QThread | None = None
         self._analysis_worker: AnalysisWorker | None = None
         self._metadata_thread: QThread | None = None
         self._metadata_worker: MetadataWorker | None = None
+        self._download_thread: QThread | None = None
+        self._download_worker: DownloadWorker | None = None
+        self._download_dialog: QProgressDialog | None = None
+
         self._sources: list[VideoSource] = []
         self._row_by_url: dict[str, int] = {}
 
         self._mpv: MPVController | None = None
         self._preview_loaded = False
         self._duration_seconds = 0.0
+        self._loop_a: float | None = None
+        self._loop_b: float | None = None
+        self._fullscreen_preview = False
 
         self._build_ui()
 
@@ -108,12 +149,17 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         root = QWidget(self)
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(8)
+
+        self.header_widget = QWidget()
+        header_layout = QVBoxLayout(self.header_widget)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(6)
 
         title = QLabel("Electro Vid-WebExt")
-        title.setStyleSheet("font-size: 26px; font-weight: 700;")
-        subtitle = QLabel("Detecta, inspecciona y previsualiza fuentes de video de una página web.")
+        title.setStyleSheet("font-size: 25px; font-weight: 700;")
+        subtitle = QLabel("Detecta, inspecciona, previsualiza y descarga fuentes de video web.")
         subtitle.setStyleSheet("color: #666;")
 
         url_row = QHBoxLayout()
@@ -125,31 +171,33 @@ class MainWindow(QMainWindow):
         url_row.addWidget(self.url_input, 1)
         url_row.addWidget(self.analyze_button)
 
+        header_layout.addWidget(title)
+        header_layout.addWidget(subtitle)
+        header_layout.addLayout(url_row)
+
         self.status_label = QLabel("Listo. Pega una URL para comenzar.")
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_results_tab(), "Resultados")
         self.tabs.addTab(self._build_preview_tab(), "Previsualización")
 
-        note = QLabel(
-            "FFprobe obtiene duración, resolución y codec. mpv reproduce con hwdec=auto-safe: "
-            "usa aceleración por hardware cuando es compatible y cae a software cuando no lo es."
+        self.note_label = QLabel(
+            "FFprobe obtiene duración, resolución y codec. mpv usa aceleración segura y "
+            "fallback por software. Descarga solo fuentes accesibles normalmente por el navegador."
         )
-        note.setWordWrap(True)
-        note.setStyleSheet("color: #777;")
+        self.note_label.setWordWrap(True)
+        self.note_label.setStyleSheet("color: #777;")
 
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        layout.addLayout(url_row)
+        layout.addWidget(self.header_widget)
         layout.addWidget(self.status_label)
         layout.addWidget(self.tabs, 1)
-        layout.addWidget(note)
+        layout.addWidget(self.note_label)
         self.setCentralWidget(root)
 
     def _build_results_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setContentsMargins(0, 6, 0, 0)
 
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
@@ -163,12 +211,15 @@ class MainWindow(QMainWindow):
 
         actions = QHBoxLayout()
         self.preview_button = QPushButton("Previsualizar")
+        self.download_button = QPushButton("⬇ Descargar")
         self.open_button = QPushButton("Abrir fuente")
         self.copy_button = QPushButton("Copiar URL")
         self.preview_button.clicked.connect(self.preview_selected)
+        self.download_button.clicked.connect(self.download_selected)
         self.open_button.clicked.connect(self.open_selected)
         self.copy_button.clicked.connect(self.copy_selected)
         actions.addWidget(self.preview_button)
+        actions.addWidget(self.download_button)
         actions.addWidget(self.open_button)
         actions.addWidget(self.copy_button)
         actions.addStretch(1)
@@ -180,39 +231,87 @@ class MainWindow(QMainWindow):
     def _build_preview_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 6, 4, 4)
+        layout.setSpacing(6)
 
         self.preview_title = QLabel("Selecciona un video y pulsa Previsualizar.")
         self.preview_title.setWordWrap(True)
 
         self.video_surface = QWidget()
         self.video_surface.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-        self.video_surface.setMinimumHeight(420)
+        self.video_surface.setMinimumHeight(120)
+        self.video_surface.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Ignored,
+        )
         self.video_surface.setStyleSheet("background: black;")
+
+        timeline = QHBoxLayout()
+        self.position_slider = QSlider(Qt.Orientation.Horizontal)
+        self.position_slider.setRange(0, 0)
+        self.position_slider.sliderReleased.connect(self._seek_from_slider)
+        self.time_label = QLabel("00:00 / 00:00")
+        timeline.addWidget(self.position_slider, 1)
+        timeline.addWidget(self.time_label)
 
         controls = QHBoxLayout()
         self.play_button = QPushButton("▶ Reproducir")
         self.stop_button = QPushButton("■ Detener")
-        self.position_slider = QSlider(Qt.Orientation.Horizontal)
-        self.position_slider.setRange(0, 0)
-        self.time_label = QLabel("00:00 / 00:00")
+        self.loop_button = QPushButton("🔁 Bucle")
+        self.loop_button.setCheckable(True)
+        self.loop_a_button = QPushButton("A")
+        self.loop_b_button = QPushButton("B")
+        self.clear_ab_button = QPushButton("A–B ✕")
+        self.fullscreen_button = QPushButton("⛶ Pantalla completa")
 
         self.play_button.clicked.connect(self.toggle_playback)
         self.stop_button.clicked.connect(self.stop_playback)
-        self.position_slider.sliderReleased.connect(self._seek_from_slider)
+        self.loop_button.toggled.connect(self.toggle_file_loop)
+        self.loop_a_button.clicked.connect(self.mark_loop_a)
+        self.loop_b_button.clicked.connect(self.mark_loop_b)
+        self.clear_ab_button.clicked.connect(self.clear_ab_loop)
+        self.fullscreen_button.clicked.connect(self.toggle_fullscreen_preview)
 
         controls.addWidget(self.play_button)
         controls.addWidget(self.stop_button)
-        controls.addWidget(self.position_slider, 1)
-        controls.addWidget(self.time_label)
+        controls.addWidget(self.loop_button)
+        controls.addWidget(self.loop_a_button)
+        controls.addWidget(self.loop_b_button)
+        controls.addWidget(self.clear_ab_button)
+        controls.addWidget(self.fullscreen_button)
+        controls.addStretch(1)
 
+        audio_controls = QHBoxLayout()
+        self.mute_button = QPushButton("🔊")
+        self.mute_button.setCheckable(True)
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(70)
+        self.volume_slider.setMaximumWidth(180)
+        self.volume_label = QLabel("70%")
+        self.ab_label = QLabel("A: —   B: —")
+
+        self.mute_button.toggled.connect(self.toggle_mute)
+        self.volume_slider.valueChanged.connect(self.set_volume)
+
+        audio_controls.addWidget(self.mute_button)
+        audio_controls.addWidget(self.volume_slider)
+        audio_controls.addWidget(self.volume_label)
+        audio_controls.addSpacing(12)
+        audio_controls.addWidget(self.ab_label)
+        audio_controls.addStretch(1)
+
+        path = MPVController.executable_path()
         self.mpv_status = QLabel(
-            "Motor: mpv" if MPVController.available() else "Motor: mpv no encontrado en PATH"
+            f"Motor: mpv · {path}" if path else "Motor: mpv no encontrado"
         )
         self.mpv_status.setStyleSheet("color: #777;")
 
         layout.addWidget(self.preview_title)
         layout.addWidget(self.video_surface, 1)
+        layout.addLayout(timeline)
         layout.addLayout(controls)
+        layout.addLayout(audio_controls)
         layout.addWidget(self.mpv_status)
         return page
 
@@ -222,8 +321,11 @@ class MainWindow(QMainWindow):
 
         controller = MPVController(int(self.video_surface.winId()))
         controller.start()
+        controller.set_volume(self.volume_slider.value())
         self._mpv = controller
-        self.mpv_status.setText("Motor: mpv · hardware seguro + fallback por software")
+        self.mpv_status.setText(
+            f"Motor: mpv · {controller.executable} · hardware seguro + fallback por software"
+        )
         return controller
 
     @Slot()
@@ -328,12 +430,15 @@ class MainWindow(QMainWindow):
         self._analysis_thread = None
         self._analysis_worker = None
 
-    def _selected_url(self) -> str | None:
+    def _selected_value(self, column: int) -> str | None:
         row = self.table.currentRow()
         if row < 0:
             return None
-        item = self.table.item(row, self.URL_COLUMN)
+        item = self.table.item(row, column)
         return item.text() if item else None
+
+    def _selected_url(self) -> str | None:
+        return self._selected_value(self.URL_COLUMN)
 
     @Slot()
     def preview_selected(self) -> None:
@@ -345,11 +450,16 @@ class MainWindow(QMainWindow):
         try:
             player = self._ensure_mpv()
             player.load(url)
+            player.set_file_loop(self.loop_button.isChecked())
+            player.set_ab_loop(None, None)
         except MPVError as exc:
             QMessageBox.warning(self, "mpv no disponible", str(exc))
             self.status_label.setText(str(exc))
             return
 
+        self._loop_a = None
+        self._loop_b = None
+        self._update_ab_label()
         self._preview_loaded = True
         self.preview_title.setText(url)
         self.tabs.setCurrentIndex(1)
@@ -382,6 +492,114 @@ class MainWindow(QMainWindow):
         self.time_label.setText("00:00 / 00:00")
         self.play_button.setText("▶ Reproducir")
 
+    @Slot(bool)
+    def toggle_file_loop(self, enabled: bool) -> None:
+        self.loop_button.setText("🔁 Bucle ON" if enabled else "🔁 Bucle")
+        if self._mpv is not None:
+            try:
+                self._mpv.set_file_loop(enabled)
+            except MPVError as exc:
+                self.status_label.setText(str(exc))
+
+    def _current_position(self) -> float | None:
+        if not self._preview_loaded or self._mpv is None:
+            return None
+        value = self._mpv.get_property("time-pos")
+        return float(value) if isinstance(value, (int, float)) else None
+
+    @Slot()
+    def mark_loop_a(self) -> None:
+        position = self._current_position()
+        if position is None:
+            return
+        self._loop_a = position
+        if self._loop_b is not None and self._loop_b <= self._loop_a:
+            self._loop_b = None
+        self._apply_ab_loop()
+
+    @Slot()
+    def mark_loop_b(self) -> None:
+        position = self._current_position()
+        if position is None:
+            return
+        if self._loop_a is None:
+            self.status_label.setText("Marca primero el punto A del bucle.")
+            return
+        if position <= self._loop_a:
+            self.status_label.setText("El punto B debe estar después del punto A.")
+            return
+        self._loop_b = position
+        self._apply_ab_loop()
+
+    def _apply_ab_loop(self) -> None:
+        self._update_ab_label()
+        if self._mpv is None:
+            return
+        try:
+            self._mpv.set_ab_loop(self._loop_a, self._loop_b)
+        except MPVError as exc:
+            self.status_label.setText(str(exc))
+
+    @Slot()
+    def clear_ab_loop(self) -> None:
+        self._loop_a = None
+        self._loop_b = None
+        self._apply_ab_loop()
+        self.status_label.setText("Bucle A–B eliminado.")
+
+    def _update_ab_label(self) -> None:
+        self.ab_label.setText(
+            f"A: {self._format_seconds(self._loop_a) if self._loop_a is not None else '—'}   "
+            f"B: {self._format_seconds(self._loop_b) if self._loop_b is not None else '—'}"
+        )
+
+    @Slot(int)
+    def set_volume(self, value: int) -> None:
+        self.volume_label.setText(f"{value}%")
+        if self._mpv is not None:
+            try:
+                self._mpv.set_volume(value)
+            except MPVError:
+                pass
+
+    @Slot(bool)
+    def toggle_mute(self, muted: bool) -> None:
+        self.mute_button.setText("🔇" if muted else "🔊")
+        if self._mpv is not None:
+            try:
+                self._mpv.set_mute(muted)
+            except MPVError:
+                pass
+
+    @Slot()
+    def toggle_fullscreen_preview(self) -> None:
+        if not self._fullscreen_preview:
+            self._fullscreen_preview = True
+            self.tabs.setCurrentIndex(1)
+            self.header_widget.hide()
+            self.status_label.hide()
+            self.note_label.hide()
+            self.tabs.tabBar().hide()
+            self.preview_title.hide()
+            self.mpv_status.hide()
+            self.fullscreen_button.setText("⛶ Salir pantalla completa")
+            self.showFullScreen()
+        else:
+            self._exit_fullscreen_preview()
+
+    def _exit_fullscreen_preview(self) -> None:
+        if not self._fullscreen_preview:
+            return
+        self._fullscreen_preview = False
+        self.header_widget.show()
+        self.status_label.show()
+        self.note_label.show()
+        self.tabs.tabBar().show()
+        self.preview_title.show()
+        self.mpv_status.show()
+        self.fullscreen_button.setText("⛶ Pantalla completa")
+        self.showMaximized()
+
     @Slot()
     def _seek_from_slider(self) -> None:
         if not self._preview_loaded:
@@ -396,12 +614,9 @@ class MainWindow(QMainWindow):
         if not self._preview_loaded or self._mpv is None:
             return
 
-        try:
-            duration = self._mpv.get_property("duration")
-            position = self._mpv.get_property("time-pos")
-            paused = self._mpv.get_property("pause")
-        except MPVError:
-            return
+        duration = self._mpv.get_property("duration")
+        position = self._mpv.get_property("time-pos")
+        paused = self._mpv.get_property("pause")
 
         if isinstance(duration, (int, float)) and duration > 0:
             self._duration_seconds = float(duration)
@@ -414,6 +629,88 @@ class MainWindow(QMainWindow):
         self.time_label.setText(
             f"{self._format_seconds(position)} / {self._format_seconds(duration)}"
         )
+
+    @Slot()
+    def download_selected(self) -> None:
+        if self._download_thread and self._download_thread.isRunning():
+            QMessageBox.information(self, "Descarga en curso", "Espera a que termine la descarga actual.")
+            return
+
+        url = self._selected_url()
+        kind = self._selected_value(self.KIND_COLUMN)
+        if not url or not kind:
+            QMessageBox.information(self, "Selecciona un video", "Selecciona una fila primero.")
+            return
+
+        parsed_name = Path(unquote(urlparse(url).path)).name
+        stem = Path(parsed_name).stem if parsed_name else "video"
+        extension = suggested_extension(url, kind)
+        default_name = f"{stem or 'video'}{extension}"
+        downloads = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+        initial = str(Path(downloads or str(Path.home())) / default_name)
+
+        destination, _ = QFileDialog.getSaveFileName(
+            self,
+            "Guardar video",
+            initial,
+            "Archivos multimedia (*.*)",
+        )
+        if not destination:
+            return
+
+        self._download_dialog = QProgressDialog("Descargando video…", "", 0, 100, self)
+        self._download_dialog.setWindowTitle("Electro Vid-WebExt")
+        self._download_dialog.setCancelButton(None)
+        self._download_dialog.setMinimumDuration(0)
+        self._download_dialog.setValue(0)
+
+        self._download_thread = QThread(self)
+        self._download_worker = DownloadWorker(url, destination, kind)
+        self._download_worker.moveToThread(self._download_thread)
+        self._download_thread.started.connect(self._download_worker.run)
+        self._download_worker.progress.connect(self._download_progress)
+        self._download_worker.finished.connect(self._download_finished)
+        self._download_worker.failed.connect(self._download_failed)
+        self._download_worker.finished.connect(self._download_thread.quit)
+        self._download_worker.failed.connect(self._download_thread.quit)
+        self._download_thread.finished.connect(self._download_worker.deleteLater)
+        self._download_thread.finished.connect(self._download_thread.deleteLater)
+        self._download_thread.finished.connect(self._cleanup_download)
+        self._download_thread.start()
+
+    @Slot(int)
+    def _download_progress(self, value: int) -> None:
+        if self._download_dialog is None:
+            return
+        if value < 0:
+            self._download_dialog.setRange(0, 0)
+            self._download_dialog.setLabelText("Procesando stream con FFmpeg…")
+        else:
+            if self._download_dialog.maximum() == 0:
+                self._download_dialog.setRange(0, 100)
+            self._download_dialog.setValue(value)
+
+    @Slot(str)
+    def _download_finished(self, destination: str) -> None:
+        if self._download_dialog is not None:
+            self._download_dialog.setRange(0, 100)
+            self._download_dialog.setValue(100)
+            self._download_dialog.close()
+        self.status_label.setText(f"Descarga completada: {destination}")
+        QMessageBox.information(self, "Descarga completada", f"Guardado en:\n{destination}")
+
+    @Slot(str)
+    def _download_failed(self, message: str) -> None:
+        if self._download_dialog is not None:
+            self._download_dialog.close()
+        self.status_label.setText("La descarga falló.")
+        QMessageBox.warning(self, "Error de descarga", message)
+
+    @Slot()
+    def _cleanup_download(self) -> None:
+        self._download_thread = None
+        self._download_worker = None
+        self._download_dialog = None
 
     @Slot()
     def open_selected(self) -> None:
@@ -438,6 +735,13 @@ class MainWindow(QMainWindow):
         if hours:
             return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         return f"{minutes:02d}:{seconds:02d}"
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self._fullscreen_preview:
+            self._exit_fullscreen_preview()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._player_timer.stop()
