@@ -35,20 +35,47 @@ def download_media(
     kind: str,
     progress: ProgressCallback | None = None,
     referer: str | None = None,
+    user_agent: str | None = None,
+    cookie_header: str | None = None,
+    origin_header: str | None = None,
 ) -> None:
     """Download a media URL, validating direct HTTP and falling back to FFmpeg."""
     suffix = Path(urlparse(url).path).suffix.lower()
     is_stream = kind.upper() in {"HLS", "DASH"} or suffix in {".m3u8", ".mpd"}
 
     if is_stream:
-        _download_with_ffmpeg(url, destination, progress, referer)
+        _download_with_ffmpeg(
+            url,
+            destination,
+            progress,
+            referer,
+            user_agent,
+            cookie_header,
+            origin_header,
+        )
         return
 
     try:
-        _download_direct(url, destination, progress, referer)
+        _download_direct(
+            url,
+            destination,
+            progress,
+            referer,
+            user_agent,
+            cookie_header,
+            origin_header,
+        )
     except Exception as direct_error:
         try:
-            _download_with_ffmpeg(url, destination, progress, referer)
+            _download_with_ffmpeg(
+            url,
+            destination,
+            progress,
+            referer,
+            user_agent,
+            cookie_header,
+            origin_header,
+        )
         except Exception as ffmpeg_error:
             raise RuntimeError(
                 "La descarga HTTP directa no produjo un video válido y el intento con "
@@ -56,24 +83,42 @@ def download_media(
             ) from ffmpeg_error
 
 
-def _headers(referer: str | None) -> dict[str, str]:
+def _headers(
+    referer: str | None,
+    user_agent: str | None = None,
+    cookie_header: str | None = None,
+    origin_header: str | None = None,
+) -> dict[str, str]:
     headers = {
-        "User-Agent": USER_AGENT,
+        "User-Agent": user_agent or USER_AGENT,
         "Accept": "*/*",
         "Accept-Encoding": "identity",
     }
     if referer:
         headers["Referer"] = referer
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    if origin_header:
+        headers["Origin"] = origin_header
     return headers
 
 
 
-def _select_best_hls_variant(url: str, referer: str | None) -> str:
+def _select_best_hls_variant(
+    url: str,
+    referer: str | None,
+    user_agent: str | None,
+    cookie_header: str | None,
+    origin_header: str | None,
+) -> str:
     """Return the highest-quality variant from an HLS master playlist when possible."""
     if not urlparse(url).path.lower().endswith(".m3u8"):
         return url
 
-    request = Request(url, headers=_headers(referer))
+    request = Request(
+        url,
+        headers=_headers(referer, user_agent, cookie_header, origin_header),
+    )
     try:
         with urlopen(request, timeout=15) as response:
             text = response.read(2 * 1024 * 1024).decode("utf-8", errors="replace")
@@ -181,13 +226,19 @@ def _download_direct(
     destination: str,
     progress: ProgressCallback | None,
     referer: str | None,
+    user_agent: str | None,
+    cookie_header: str | None,
+    origin_header: str | None,
 ) -> None:
     target = Path(destination)
     temp_target = _temporary_target(destination)
     target.parent.mkdir(parents=True, exist_ok=True)
     temp_target.unlink(missing_ok=True)
 
-    request = Request(url, headers=_headers(referer))
+    request = Request(
+        url,
+        headers=_headers(referer, user_agent, cookie_header, origin_header),
+    )
 
     try:
         with urlopen(request, timeout=30) as response:
@@ -228,6 +279,9 @@ def _download_with_ffmpeg(
     destination: str,
     progress: ProgressCallback | None,
     referer: str | None,
+    user_agent: str | None,
+    cookie_header: str | None,
+    origin_header: str | None,
 ) -> None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -241,7 +295,13 @@ def _download_with_ffmpeg(
     if progress:
         progress(-1)
 
-    source_url = _select_best_hls_variant(url, referer)
+    source_url = _select_best_hls_variant(
+        url,
+        referer,
+        user_agent,
+        cookie_header,
+        origin_header,
+    )
 
     command = [
         ffmpeg,
@@ -250,10 +310,18 @@ def _download_with_ffmpeg(
         "error",
         "-y",
         "-user_agent",
-        USER_AGENT,
+        user_agent or USER_AGENT,
     ]
     if referer:
         command.extend(["-referer", referer])
+
+    extra_headers: list[str] = []
+    if cookie_header:
+        extra_headers.append(f"Cookie: {cookie_header}")
+    if origin_header:
+        extra_headers.append(f"Origin: {origin_header}")
+    if extra_headers:
+        command.extend(["-headers", "\r\n".join(extra_headers) + "\r\n"])
 
     command.extend(
         [
