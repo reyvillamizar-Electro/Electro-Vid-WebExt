@@ -9,6 +9,7 @@ from PySide6.QtCore import QObject, QStandardPaths, QThread, QTimer, Qt, Signal,
 from PySide6.QtGui import QCloseEvent, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -22,14 +23,30 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QHeaderView,
     QVBoxLayout,
     QWidget,
 )
 
-from electro_vid_webext.core.detector import VideoSource, detect_video_sources
+from electro_vid_webext.core.detector import VideoSource, detect_video_sources, media_kind_from_url
 from electro_vid_webext.core.downloader import download_media, suggested_extension
 from electro_vid_webext.core.metadata import MediaMetadata, ffprobe_available, read_media_metadata
 from electro_vid_webext.core.mpv_player import MPVController, MPVError
+from electro_vid_webext.ui.browser_view import BrowserView
+
+
+class SortItem(QTableWidgetItem):
+    def __init__(self, text: str, sort_value=None) -> None:
+        super().__init__(text)
+        self.sort_value = text.lower() if sort_value is None else sort_value
+
+    def __lt__(self, other) -> bool:
+        if isinstance(other, SortItem):
+            try:
+                return self.sort_value < other.sort_value
+            except TypeError:
+                return str(self.sort_value) < str(other.sort_value)
+        return super().__lt__(other)
 
 
 class AnalysisWorker(QObject):
@@ -116,7 +133,13 @@ class DownloadWorker(QObject):
 
 class MainWindow(QMainWindow):
     KIND_COLUMN = 0
-    URL_COLUMN = 6
+    DURATION_COLUMN = 1
+    QUALITY_COLUMN = 2
+    RESOLUTION_COLUMN = 3
+    CODEC_COLUMN = 4
+    SIZE_COLUMN = 5
+    ORIGIN_COLUMN = 6
+    URL_COLUMN = 7
 
     def __init__(self) -> None:
         super().__init__()
@@ -133,7 +156,8 @@ class MainWindow(QMainWindow):
         self._download_dialog: QProgressDialog | None = None
 
         self._sources: list[VideoSource] = []
-        self._row_by_url: dict[str, int] = {}
+        self._known_urls: set[str] = set()
+        self._pending_metadata: dict[str, VideoSource] = {}
 
         self._mpv: MPVController | None = None
         self._preview_loaded = False
@@ -184,6 +208,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_results_tab(), "Resultados")
         self.tabs.addTab(self._build_preview_tab(), "Previsualización")
+        self.tabs.addTab(self._build_browser_tab(), "Navegador")
 
         self.note_label = QLabel(
             "FFprobe obtiene duración, resolución y codec. mpv usa aceleración segura y "
@@ -203,14 +228,39 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 6, 0, 0)
 
-        self.table = QTableWidget(0, 7)
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filtrar:"))
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("Escribe para filtrar resultados…")
+        self.filter_column = QComboBox()
+        self.filter_column.addItems(
+            ["Todas", "Tipo", "Duración", "Calidad", "Resolución", "Codec", "Tamaño", "Detectado en", "URL"]
+        )
+        self.filter_input.textChanged.connect(self._apply_table_filter)
+        self.filter_column.currentIndexChanged.connect(self._apply_table_filter)
+        filter_row.addWidget(self.filter_input, 1)
+        filter_row.addWidget(self.filter_column)
+
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
-            ["Tipo", "Duración", "Calidad", "Codec", "Tamaño", "Detectado en", "URL"]
+            ["Tipo", "Duración", "Calidad", "Resolución", "Codec", "Tamaño", "Detectado en", "URL"]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSortingEnabled(True)
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(70)
+
+        widths = [90, 95, 105, 125, 130, 105, 190, 650]
+        for column, width in enumerate(widths):
+            self.table.setColumnWidth(column, width)
+
         self.table.doubleClicked.connect(self.preview_selected)
 
         actions = QHBoxLayout()
@@ -228,6 +278,7 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.copy_button)
         actions.addStretch(1)
 
+        layout.addLayout(filter_row)
         layout.addWidget(self.table, 1)
         layout.addLayout(actions)
         return page
@@ -322,6 +373,37 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.mpv_status)
         return page
 
+    def _build_browser_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 6, 4, 4)
+
+        controls = QHBoxLayout()
+        back_button = QPushButton("← Atrás")
+        reload_button = QPushButton("↻ Recargar")
+        rescan_button = QPushButton("Detectar ahora")
+        browser_note = QLabel(
+            "Interactúa con la página o inicia el video; las fuentes de red aparecerán en Resultados."
+        )
+        browser_note.setWordWrap(True)
+
+        self.browser = BrowserView()
+        self.browser.media_found.connect(self._dynamic_media_found)
+
+        back_button.clicked.connect(self.browser.back)
+        reload_button.clicked.connect(self.browser.reload)
+        rescan_button.clicked.connect(self.browser.rescan_dom)
+
+        controls.addWidget(back_button)
+        controls.addWidget(reload_button)
+        controls.addWidget(rescan_button)
+        controls.addStretch(1)
+
+        layout.addLayout(controls)
+        layout.addWidget(browser_note)
+        layout.addWidget(self.browser, 1)
+        return page
+
     def _ensure_mpv(self) -> MPVController:
         if self._mpv is not None:
             return self._mpv
@@ -346,11 +428,15 @@ class MainWindow(QMainWindow):
             return
 
         self.stop_playback()
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
+        self.table.setSortingEnabled(True)
         self._sources = []
-        self._row_by_url = {}
+        self._known_urls = set()
+        self._pending_metadata = {}
         self.analyze_button.setEnabled(False)
-        self.status_label.setText("Analizando página…")
+        self.status_label.setText("Analizando página y cargando navegador…")
+        self.browser.load_page(url)
 
         self._analysis_thread = QThread(self)
         self._analysis_worker = AnalysisWorker(url)
@@ -367,25 +453,72 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def _analysis_finished(self, sources: list[VideoSource]) -> None:
-        self._sources = sources
+        for source in sources:
+            self._add_source(source)
 
-        for row, source in enumerate(sources):
-            self.table.insertRow(row)
-            self._row_by_url[source.url] = row
-            values = [source.kind, "…", "…", "…", "…", source.origin, source.url]
-            for column, value in enumerate(values):
-                self.table.setItem(row, column, QTableWidgetItem(value))
-
-        if sources:
+        if self._sources:
             extra = "" if ffprobe_available() else " (ffprobe no detectado)"
             self.status_label.setText(
-                f"{len(sources)} fuente(s) encontrada(s). Leyendo metadatos…{extra}"
+                f"{len(self._sources)} fuente(s) encontrada(s). Leyendo metadatos…{extra}"
             )
-            self.table.selectRow(0)
-            self._start_metadata_scan(sources)
+            if self.table.rowCount() > 0:
+                self.table.selectRow(0)
+            self._scan_pending_metadata()
         else:
-            self.status_label.setText("No se encontraron fuentes directas en el HTML de esta página.")
+            self.status_label.setText(
+                "El HTML inicial no mostró fuentes. El navegador seguirá inspeccionando la red."
+            )
             self.analyze_button.setEnabled(True)
+
+    def _add_source(self, source: VideoSource) -> bool:
+        if not source.url or source.url in self._known_urls:
+            return False
+
+        self._known_urls.add(source.url)
+        self._sources.append(source)
+        self._pending_metadata[source.url] = source
+
+        sorting = self.table.isSortingEnabled()
+        self.table.setSortingEnabled(False)
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        values = [
+            source.kind,
+            "…",
+            "…",
+            "…",
+            "…",
+            "…",
+            source.origin,
+            source.url,
+        ]
+        for column, value in enumerate(values):
+            self.table.setItem(row, column, SortItem(value, -1 if value == "…" else value.lower()))
+        self.table.setSortingEnabled(sorting)
+        self._apply_table_filter()
+        return True
+
+    @Slot(str, str)
+    def _dynamic_media_found(self, url: str, origin: str) -> None:
+        kind = media_kind_from_url(url)
+        if not kind:
+            return
+
+        if self._add_source(VideoSource(url=url, kind=kind, origin=origin)):
+            self.status_label.setText(
+                f"{len(self._sources)} fuente(s) detectada(s). Nueva fuente capturada por navegador."
+            )
+            QTimer.singleShot(250, self._scan_pending_metadata)
+
+    def _scan_pending_metadata(self) -> None:
+        if self._metadata_thread and self._metadata_thread.isRunning():
+            return
+        if not self._pending_metadata:
+            return
+
+        batch = list(self._pending_metadata.values())
+        self._pending_metadata.clear()
+        self._start_metadata_scan(batch)
 
     def _start_metadata_scan(self, sources: list[VideoSource]) -> None:
         if self._metadata_thread and self._metadata_thread.isRunning():
@@ -405,13 +538,21 @@ class MainWindow(QMainWindow):
 
     @Slot(str, object)
     def _metadata_ready(self, url: str, metadata: MediaMetadata) -> None:
-        row = self._row_by_url.get(url)
+        row = self._row_for_url(url)
         if row is None:
             return
-        self.table.setItem(row, 1, QTableWidgetItem(metadata.duration))
-        self.table.setItem(row, 2, QTableWidgetItem(metadata.quality))
-        self.table.setItem(row, 3, QTableWidgetItem(metadata.codec))
-        self.table.setItem(row, 4, QTableWidgetItem(metadata.size))
+
+        sorting = self.table.isSortingEnabled()
+        self.table.setSortingEnabled(False)
+
+        self.table.setItem(row, self.DURATION_COLUMN, SortItem(metadata.duration, self._duration_sort(metadata.duration)))
+        self.table.setItem(row, self.QUALITY_COLUMN, SortItem(metadata.quality, self._quality_sort(metadata.quality)))
+        self.table.setItem(row, self.RESOLUTION_COLUMN, SortItem(metadata.resolution, self._resolution_sort(metadata.resolution)))
+        self.table.setItem(row, self.CODEC_COLUMN, SortItem(metadata.codec))
+        self.table.setItem(row, self.SIZE_COLUMN, SortItem(metadata.size, self._size_sort(metadata.size)))
+
+        self.table.setSortingEnabled(sorting)
+        self._apply_table_filter()
 
     @Slot(int, int)
     def _metadata_progress(self, completed: int, total: int) -> None:
@@ -425,6 +566,8 @@ class MainWindow(QMainWindow):
         self._metadata_worker = None
         self.analyze_button.setEnabled(True)
         self.status_label.setText(f"{len(self._sources)} fuente(s) de video lista(s).")
+        if self._pending_metadata:
+            QTimer.singleShot(100, self._scan_pending_metadata)
 
     @Slot(str)
     def _analysis_failed(self, message: str) -> None:
@@ -436,6 +579,74 @@ class MainWindow(QMainWindow):
     def _cleanup_analysis_thread(self) -> None:
         self._analysis_thread = None
         self._analysis_worker = None
+
+    def _row_for_url(self, url: str) -> int | None:
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, self.URL_COLUMN)
+            if item and item.text() == url:
+                return row
+        return None
+
+    @Slot()
+    def _apply_table_filter(self, *_args) -> None:
+        if not hasattr(self, "filter_input"):
+            return
+
+        needle = self.filter_input.text().strip().lower()
+        selected = self.filter_column.currentIndex()
+
+        for row in range(self.table.rowCount()):
+            if not needle:
+                self.table.setRowHidden(row, False)
+                continue
+
+            columns = range(self.table.columnCount()) if selected == 0 else [selected - 1]
+            visible = any(
+                needle in (self.table.item(row, column).text().lower() if self.table.item(row, column) else "")
+                for column in columns
+            )
+            self.table.setRowHidden(row, not visible)
+
+    @staticmethod
+    def _duration_sort(value: str) -> int:
+        if not value or value == "—":
+            return -1
+        parts = value.split(":")
+        try:
+            numbers = [int(part) for part in parts]
+        except ValueError:
+            return -1
+        if len(numbers) == 3:
+            return numbers[0] * 3600 + numbers[1] * 60 + numbers[2]
+        if len(numbers) == 2:
+            return numbers[0] * 60 + numbers[1]
+        return -1
+
+    @staticmethod
+    def _quality_sort(value: str) -> int:
+        import re
+        match = re.search(r"(\d{3,4})p", value)
+        return int(match.group(1)) if match else -1
+
+    @staticmethod
+    def _resolution_sort(value: str) -> int:
+        import re
+        match = re.search(r"(\d+)\D+(\d+)", value)
+        return int(match.group(1)) * int(match.group(2)) if match else -1
+
+    @staticmethod
+    def _size_sort(value: str) -> float:
+        if not value or value == "—":
+            return -1.0
+        parts = value.split()
+        if len(parts) != 2:
+            return -1.0
+        try:
+            number = float(parts[0])
+        except ValueError:
+            return -1.0
+        factors = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+        return number * factors.get(parts[1].upper(), 1)
 
     def _selected_value(self, column: int) -> str | None:
         row = self.table.currentRow()
