@@ -3,10 +3,8 @@ from __future__ import annotations
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from PySide6.QtCore import QObject, QThread, QUrl, Signal, Slot
-from PySide6.QtGui import QGuiApplication
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtGui import QCloseEvent, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -22,10 +20,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import Qt
 
 from electro_vid_webext.core.detector import VideoSource, detect_video_sources
 from electro_vid_webext.core.metadata import MediaMetadata, ffprobe_available, read_media_metadata
+from electro_vid_webext.core.mpv_player import MPVController, MPVError
 
 
 class AnalysisWorker(QObject):
@@ -83,10 +81,12 @@ class MetadataWorker(QObject):
 
 
 class MainWindow(QMainWindow):
+    URL_COLUMN = 6
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Electro Vid-WebExt")
-        self.resize(1180, 720)
+        self.resize(1280, 760)
 
         self._analysis_thread: QThread | None = None
         self._analysis_worker: AnalysisWorker | None = None
@@ -95,13 +95,15 @@ class MainWindow(QMainWindow):
         self._sources: list[VideoSource] = []
         self._row_by_url: dict[str, int] = {}
 
-        self.audio_output = QAudioOutput(self)
-        self.player = QMediaPlayer(self)
-        self.player.setAudioOutput(self.audio_output)
-        self.audio_output.setVolume(0.7)
+        self._mpv: MPVController | None = None
+        self._preview_loaded = False
+        self._duration_seconds = 0.0
 
         self._build_ui()
-        self._connect_player()
+
+        self._player_timer = QTimer(self)
+        self._player_timer.setInterval(500)
+        self._player_timer.timeout.connect(self._refresh_player_state)
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -130,9 +132,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_preview_tab(), "Previsualización")
 
         note = QLabel(
-            "Duración y resolución se obtienen con ffprobe cuando está disponible. "
-            "El tamaño se intenta obtener desde los encabezados HTTP. "
-            "Streams HLS/DASH pueden no informar un tamaño único."
+            "FFprobe obtiene duración, resolución y codec. mpv reproduce con hwdec=auto-safe: "
+            "usa aceleración por hardware cuando es compatible y cae a software cuando no lo es."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #777;")
@@ -150,9 +151,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 10, 0, 0)
 
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Tipo", "Duración", "Calidad", "Tamaño", "Detectado en", "URL"]
+            ["Tipo", "Duración", "Calidad", "Codec", "Tamaño", "Detectado en", "URL"]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -180,38 +181,50 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
 
-        self.video_widget = QVideoWidget()
-        self.video_widget.setMinimumHeight(360)
-        self.player.setVideoOutput(self.video_widget)
-
         self.preview_title = QLabel("Selecciona un video y pulsa Previsualizar.")
         self.preview_title.setWordWrap(True)
+
+        self.video_surface = QWidget()
+        self.video_surface.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.video_surface.setMinimumHeight(420)
+        self.video_surface.setStyleSheet("background: black;")
 
         controls = QHBoxLayout()
         self.play_button = QPushButton("▶ Reproducir")
         self.stop_button = QPushButton("■ Detener")
         self.position_slider = QSlider(Qt.Orientation.Horizontal)
+        self.position_slider.setRange(0, 0)
         self.time_label = QLabel("00:00 / 00:00")
 
         self.play_button.clicked.connect(self.toggle_playback)
-        self.stop_button.clicked.connect(self.player.stop)
-        self.position_slider.sliderMoved.connect(self.player.setPosition)
+        self.stop_button.clicked.connect(self.stop_playback)
+        self.position_slider.sliderReleased.connect(self._seek_from_slider)
 
         controls.addWidget(self.play_button)
         controls.addWidget(self.stop_button)
         controls.addWidget(self.position_slider, 1)
         controls.addWidget(self.time_label)
 
+        self.mpv_status = QLabel(
+            "Motor: mpv" if MPVController.available() else "Motor: mpv no encontrado en PATH"
+        )
+        self.mpv_status.setStyleSheet("color: #777;")
+
         layout.addWidget(self.preview_title)
-        layout.addWidget(self.video_widget, 1)
+        layout.addWidget(self.video_surface, 1)
         layout.addLayout(controls)
+        layout.addWidget(self.mpv_status)
         return page
 
-    def _connect_player(self) -> None:
-        self.player.positionChanged.connect(self._update_position)
-        self.player.durationChanged.connect(self._update_duration)
-        self.player.playbackStateChanged.connect(self._update_play_button)
-        self.player.errorOccurred.connect(self._player_error)
+    def _ensure_mpv(self) -> MPVController:
+        if self._mpv is not None:
+            return self._mpv
+
+        controller = MPVController(int(self.video_surface.winId()))
+        controller.start()
+        self._mpv = controller
+        self.mpv_status.setText("Motor: mpv · hardware seguro + fallback por software")
+        return controller
 
     @Slot()
     def start_analysis(self) -> None:
@@ -223,7 +236,7 @@ class MainWindow(QMainWindow):
         if self._analysis_thread and self._analysis_thread.isRunning():
             return
 
-        self.player.stop()
+        self.stop_playback()
         self.table.setRowCount(0)
         self._sources = []
         self._row_by_url = {}
@@ -250,12 +263,12 @@ class MainWindow(QMainWindow):
         for row, source in enumerate(sources):
             self.table.insertRow(row)
             self._row_by_url[source.url] = row
-            values = [source.kind, "…", "…", "…", source.origin, source.url]
+            values = [source.kind, "…", "…", "…", "…", source.origin, source.url]
             for column, value in enumerate(values):
                 self.table.setItem(row, column, QTableWidgetItem(value))
 
         if sources:
-            extra = "" if ffprobe_available() else " (ffprobe no detectado: duración/calidad pueden quedar vacías)"
+            extra = "" if ffprobe_available() else " (ffprobe no detectado)"
             self.status_label.setText(
                 f"{len(sources)} fuente(s) encontrada(s). Leyendo metadatos…{extra}"
             )
@@ -288,7 +301,8 @@ class MainWindow(QMainWindow):
             return
         self.table.setItem(row, 1, QTableWidgetItem(metadata.duration))
         self.table.setItem(row, 2, QTableWidgetItem(metadata.quality))
-        self.table.setItem(row, 3, QTableWidgetItem(metadata.size))
+        self.table.setItem(row, 3, QTableWidgetItem(metadata.codec))
+        self.table.setItem(row, 4, QTableWidgetItem(metadata.size))
 
     @Slot(int, int)
     def _metadata_progress(self, completed: int, total: int) -> None:
@@ -318,7 +332,7 @@ class MainWindow(QMainWindow):
         row = self.table.currentRow()
         if row < 0:
             return None
-        item = self.table.item(row, 5)
+        item = self.table.item(row, self.URL_COLUMN)
         return item.text() if item else None
 
     @Slot()
@@ -328,10 +342,78 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Selecciona un video", "Selecciona una fila primero.")
             return
 
+        try:
+            player = self._ensure_mpv()
+            player.load(url)
+        except MPVError as exc:
+            QMessageBox.warning(self, "mpv no disponible", str(exc))
+            self.status_label.setText(str(exc))
+            return
+
+        self._preview_loaded = True
         self.preview_title.setText(url)
-        self.player.setSource(QUrl(url))
         self.tabs.setCurrentIndex(1)
-        self.player.play()
+        self.play_button.setText("⏸ Pausar")
+        self._player_timer.start()
+        self.status_label.setText("Reproduciendo con mpv.")
+
+    @Slot()
+    def toggle_playback(self) -> None:
+        if not self._preview_loaded:
+            return
+        try:
+            player = self._ensure_mpv()
+            player.toggle_pause()
+            paused = bool(player.get_property("pause"))
+            self.play_button.setText("▶ Reproducir" if paused else "⏸ Pausar")
+        except MPVError as exc:
+            self.status_label.setText(str(exc))
+
+    @Slot()
+    def stop_playback(self) -> None:
+        if self._mpv is not None:
+            try:
+                self._mpv.stop()
+            except MPVError:
+                pass
+        self._preview_loaded = False
+        self._player_timer.stop()
+        self.position_slider.setRange(0, 0)
+        self.time_label.setText("00:00 / 00:00")
+        self.play_button.setText("▶ Reproducir")
+
+    @Slot()
+    def _seek_from_slider(self) -> None:
+        if not self._preview_loaded:
+            return
+        try:
+            self._ensure_mpv().seek_absolute(float(self.position_slider.value()))
+        except MPVError as exc:
+            self.status_label.setText(str(exc))
+
+    @Slot()
+    def _refresh_player_state(self) -> None:
+        if not self._preview_loaded or self._mpv is None:
+            return
+
+        try:
+            duration = self._mpv.get_property("duration")
+            position = self._mpv.get_property("time-pos")
+            paused = self._mpv.get_property("pause")
+        except MPVError:
+            return
+
+        if isinstance(duration, (int, float)) and duration > 0:
+            self._duration_seconds = float(duration)
+            self.position_slider.setRange(0, int(duration))
+
+        if isinstance(position, (int, float)) and not self.position_slider.isSliderDown():
+            self.position_slider.setValue(int(position))
+
+        self.play_button.setText("▶ Reproducir" if paused else "⏸ Pausar")
+        self.time_label.setText(
+            f"{self._format_seconds(position)} / {self._format_seconds(duration)}"
+        )
 
     @Slot()
     def open_selected(self) -> None:
@@ -346,46 +428,19 @@ class MainWindow(QMainWindow):
             QGuiApplication.clipboard().setText(url)
             self.status_label.setText("URL copiada al portapapeles.")
 
-    @Slot()
-    def toggle_playback(self) -> None:
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
-        else:
-            self.player.play()
-
-    @Slot(int)
-    def _update_position(self, position: int) -> None:
-        if not self.position_slider.isSliderDown():
-            self.position_slider.setValue(position)
-        self._refresh_time_label(position, self.player.duration())
-
-    @Slot(int)
-    def _update_duration(self, duration: int) -> None:
-        self.position_slider.setRange(0, max(duration, 0))
-        self._refresh_time_label(self.player.position(), duration)
-
-    @Slot(object)
-    def _update_play_button(self, state: QMediaPlayer.PlaybackState) -> None:
-        if state == QMediaPlayer.PlaybackState.PlayingState:
-            self.play_button.setText("⏸ Pausar")
-        else:
-            self.play_button.setText("▶ Reproducir")
-
-    @Slot(object, str)
-    def _player_error(self, _error, error_string: str) -> None:
-        if error_string:
-            self.status_label.setText(f"Reproductor: {error_string}")
-
-    def _refresh_time_label(self, position_ms: int, duration_ms: int) -> None:
-        self.time_label.setText(
-            f"{self._format_ms(position_ms)} / {self._format_ms(duration_ms)}"
-        )
-
     @staticmethod
-    def _format_ms(milliseconds: int) -> str:
-        seconds = max(milliseconds, 0) // 1000
-        hours, remainder = divmod(seconds, 3600)
-        minutes, secs = divmod(remainder, 60)
+    def _format_seconds(value: object) -> str:
+        if not isinstance(value, (int, float)) or value < 0:
+            return "00:00"
+        total = int(value)
+        hours, remainder = divmod(total, 3600)
+        minutes, seconds = divmod(remainder, 60)
         if hours:
-            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-        return f"{minutes:02d}:{secs:02d}"
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._player_timer.stop()
+        if self._mpv is not None:
+            self._mpv.close()
+        super().closeEvent(event)
