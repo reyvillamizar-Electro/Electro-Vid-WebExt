@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -120,9 +121,22 @@ def _probe_with_ffprobe(url: str, timeout: float = 20.0) -> tuple[float | None, 
     return duration, quality
 
 
+def _quality_from_url(url: str) -> str:
+    resolution = re.search(r"(?<!\d)(\d{3,4})[xX×](\d{3,4})(?!\d)", url)
+    if resolution:
+        return f"{resolution.group(1)}×{resolution.group(2)}"
+
+    vertical = re.search(r"(?<!\d)(2160|1440|1080|720|576|480|360|240)p(?!\d)", url, re.IGNORECASE)
+    if vertical:
+        return f"{vertical.group(1)}p"
+    return "—"
+
+
 def read_media_metadata(url: str) -> MediaMetadata:
     size = _http_size(url)
     duration, quality = _probe_with_ffprobe(url)
+    if quality == "—":
+        quality = _quality_from_url(url)
     return MediaMetadata(
         duration=_format_duration(duration),
         quality=quality,
