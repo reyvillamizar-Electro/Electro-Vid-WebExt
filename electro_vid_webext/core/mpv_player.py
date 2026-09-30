@@ -15,14 +15,34 @@ class MPVError(RuntimeError):
     pass
 
 
+def find_mpv_executable() -> str | None:
+    """Find mpv from PATH or common Windows install locations."""
+    executable = shutil.which("mpv")
+    if executable:
+        return executable
+
+    if os.name == "nt":
+        candidates = [
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "MPV Player" / "mpv.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "mpv" / "mpv.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "mpv" / "mpv.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "mpv" / "mpv.exe",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+
+    return None
+
+
 class MPVController:
     """Small controller around an external mpv process with JSON IPC."""
 
     def __init__(self, window_id: int) -> None:
-        executable = shutil.which("mpv")
+        executable = find_mpv_executable()
         if not executable:
             raise MPVError(
-                "No se encontró mpv.exe en el PATH. Instala mpv y reinicia la aplicación."
+                "No se encontró mpv.exe. Instala mpv o añádelo al PATH de Windows."
             )
 
         self.executable = executable
@@ -32,7 +52,11 @@ class MPVController:
 
     @staticmethod
     def available() -> bool:
-        return shutil.which("mpv") is not None
+        return find_mpv_executable() is not None
+
+    @staticmethod
+    def executable_path() -> str | None:
+        return find_mpv_executable()
 
     def _make_ipc_path(self) -> str:
         if os.name == "nt":
