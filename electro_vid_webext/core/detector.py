@@ -26,6 +26,13 @@ class VideoSource:
     url: str
     kind: str
     origin: str
+    referer: str | None = None
+    user_agent: str | None = None
+    cookie_header: str | None = None
+    origin_header: str | None = None
+    quality_hint: str = "—"
+    resolution_hint: str = "—"
+    protection: str = "—"
 
 
 class _MediaHTMLParser(HTMLParser):
