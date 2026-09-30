@@ -175,6 +175,22 @@ class MPVController:
     def seek_absolute(self, seconds: float) -> None:
         self.command("seek", float(seconds), "absolute", "exact")
 
+    def set_property(self, name: str, value: Any) -> None:
+        self.command("set_property", name, value)
+
+    def set_volume(self, value: int) -> None:
+        self.set_property("volume", max(0, min(int(value), 100)))
+
+    def set_mute(self, muted: bool) -> None:
+        self.set_property("mute", bool(muted))
+
+    def set_file_loop(self, enabled: bool) -> None:
+        self.set_property("loop-file", "inf" if enabled else "no")
+
+    def set_ab_loop(self, start: float | None, end: float | None) -> None:
+        self.set_property("ab-loop-a", "no" if start is None else float(start))
+        self.set_property("ab-loop-b", "no" if end is None else float(end))
+
     def get_property(self, name: str) -> Any:
         try:
             return self.command("get_property", name)
