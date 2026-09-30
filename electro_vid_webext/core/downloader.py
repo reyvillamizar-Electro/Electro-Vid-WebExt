@@ -9,6 +9,15 @@ from urllib.request import Request, urlopen
 
 ProgressCallback = Callable[[int], None]
 
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+BAD_CONTENT_TYPES = (
+    "text/html",
+    "text/plain",
+    "application/json",
+    "application/xml",
+    "text/xml",
+)
+
 
 def suggested_extension(url: str, kind: str) -> str:
     suffix = Path(urlparse(url).path).suffix.lower()
@@ -24,64 +33,122 @@ def download_media(
     destination: str,
     kind: str,
     progress: ProgressCallback | None = None,
+    referer: str | None = None,
 ) -> None:
+    """Download a media URL, validating direct HTTP and falling back to FFmpeg."""
     suffix = Path(urlparse(url).path).suffix.lower()
-    if kind.upper() in {"HLS", "DASH"} or suffix in {".m3u8", ".mpd"}:
-        _download_stream(url, destination, progress)
-    else:
-        _download_direct(url, destination, progress)
+    is_stream = kind.upper() in {"HLS", "DASH"} or suffix in {".m3u8", ".mpd"}
+
+    if is_stream:
+        _download_with_ffmpeg(url, destination, progress, referer)
+        return
+
+    try:
+        _download_direct(url, destination, progress, referer)
+    except Exception as direct_error:
+        try:
+            _download_with_ffmpeg(url, destination, progress, referer)
+        except Exception as ffmpeg_error:
+            raise RuntimeError(
+                "La descarga HTTP directa no produjo un video válido y el intento con "
+                f"FFmpeg también falló.\n\nHTTP: {direct_error}\n\nFFmpeg: {ffmpeg_error}"
+            ) from ffmpeg_error
+
+
+def _headers(referer: str | None) -> dict[str, str]:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+    }
+    if referer:
+        headers["Referer"] = referer
+    return headers
+
+
+def _temporary_target(destination: str) -> Path:
+    target = Path(destination)
+    suffix = target.suffix or ".mp4"
+    return target.with_name(f"{target.stem}.part{suffix}")
+
+
+def _validate_download(path: Path, content_type: str = "") -> None:
+    if not path.exists():
+        raise RuntimeError("El servidor no creó ningún archivo.")
+
+    size = path.stat().st_size
+    if size <= 0:
+        raise RuntimeError("El servidor devolvió un archivo vacío.")
+
+    normalized = content_type.lower().split(";", 1)[0].strip()
+    if any(normalized.startswith(value) for value in BAD_CONTENT_TYPES):
+        raise RuntimeError(
+            f"El servidor devolvió {content_type or 'contenido no multimedia'} en vez del video."
+        )
 
 
 def _download_direct(
     url: str,
     destination: str,
     progress: ProgressCallback | None,
+    referer: str | None,
 ) -> None:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "*/*",
-        },
-    )
     target = Path(destination)
+    temp_target = _temporary_target(destination)
     target.parent.mkdir(parents=True, exist_ok=True)
+    temp_target.unlink(missing_ok=True)
+
+    request = Request(url, headers=_headers(referer))
 
     try:
-        with urlopen(request, timeout=30) as response, target.open("wb") as output:
+        with urlopen(request, timeout=30) as response:
+            status = getattr(response, "status", 200)
+            if status >= 400:
+                raise RuntimeError(f"El servidor respondió HTTP {status}.")
+
+            content_type = response.headers.get("Content-Type", "")
             total_header = response.headers.get("Content-Length")
             total = int(total_header) if total_header and total_header.isdigit() else 0
-            received = 0
 
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                output.write(chunk)
-                received += len(chunk)
-                if progress and total > 0:
-                    progress(min(100, int(received * 100 / total)))
+            if total_header == "0":
+                raise RuntimeError("El servidor informó Content-Length: 0.")
+
+            received = 0
+            with temp_target.open("wb") as output:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    received += len(chunk)
+                    if progress and total > 0:
+                        progress(min(99, int(received * 100 / total)))
+
+        _validate_download(temp_target, content_type)
+        temp_target.replace(target)
 
         if progress:
             progress(100)
     except Exception:
-        target.unlink(missing_ok=True)
+        temp_target.unlink(missing_ok=True)
         raise
 
 
-def _download_stream(
+def _download_with_ffmpeg(
     url: str,
     destination: str,
     progress: ProgressCallback | None,
+    referer: str | None,
 ) -> None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        raise RuntimeError(
-            "Esta fuente es HLS/DASH y requiere ffmpeg para descargarla."
-        )
+        raise RuntimeError("FFmpeg no está disponible en el PATH.")
 
     target = Path(destination)
+    temp_target = _temporary_target(destination)
     target.parent.mkdir(parents=True, exist_ok=True)
+    temp_target.unlink(missing_ok=True)
+
     if progress:
         progress(-1)
 
@@ -91,24 +158,43 @@ def _download_stream(
         "-loglevel",
         "error",
         "-y",
-        "-i",
-        url,
-        "-c",
-        "copy",
-        str(target),
+        "-user_agent",
+        USER_AGENT,
     ]
+    if referer:
+        command.extend(["-referer", referer])
 
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    command.extend(
+        [
+            "-i",
+            url,
+            "-map",
+            "0:v?",
+            "-map",
+            "0:a?",
+            "-c",
+            "copy",
+            str(temp_target),
+        ]
     )
-    if completed.returncode != 0:
-        target.unlink(missing_ok=True)
-        message = completed.stderr.strip() or "FFmpeg no pudo guardar el stream."
-        raise RuntimeError(message)
 
-    if progress:
-        progress(100)
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if completed.returncode != 0:
+            message = completed.stderr.strip() or "FFmpeg no pudo guardar la fuente."
+            raise RuntimeError(message)
+
+        _validate_download(temp_target)
+        temp_target.replace(target)
+
+        if progress:
+            progress(100)
+    except Exception:
+        temp_target.unlink(missing_ok=True)
+        raise
