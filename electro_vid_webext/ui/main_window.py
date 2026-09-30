@@ -91,11 +91,12 @@ class DownloadWorker(QObject):
     finished = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, url: str, destination: str, kind: str) -> None:
+    def __init__(self, url: str, destination: str, kind: str, referer: str | None) -> None:
         super().__init__()
         self.url = url
         self.destination = destination
         self.kind = kind
+        self.referer = referer
 
     @Slot()
     def run(self) -> None:
@@ -105,6 +106,7 @@ class DownloadWorker(QObject):
                 self.destination,
                 self.kind,
                 progress=self.progress.emit,
+                referer=self.referer,
             )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -135,6 +137,8 @@ class MainWindow(QMainWindow):
 
         self._mpv: MPVController | None = None
         self._preview_loaded = False
+        self._preview_url: str | None = None
+        self._preview_kind: str | None = None
         self._duration_seconds = 0.0
         self._loop_a: float | None = None
         self._loop_b: float | None = None
@@ -262,6 +266,7 @@ class MainWindow(QMainWindow):
         self.loop_a_button = QPushButton("A")
         self.loop_b_button = QPushButton("B")
         self.clear_ab_button = QPushButton("A–B ✕")
+        self.download_preview_button = QPushButton("⬇ Descargar")
         self.fullscreen_button = QPushButton("⛶ Pantalla completa")
 
         self.play_button.clicked.connect(self.toggle_playback)
@@ -270,6 +275,7 @@ class MainWindow(QMainWindow):
         self.loop_a_button.clicked.connect(self.mark_loop_a)
         self.loop_b_button.clicked.connect(self.mark_loop_b)
         self.clear_ab_button.clicked.connect(self.clear_ab_loop)
+        self.download_preview_button.clicked.connect(self.download_preview)
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen_preview)
 
         controls.addWidget(self.play_button)
@@ -278,6 +284,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.loop_a_button)
         controls.addWidget(self.loop_b_button)
         controls.addWidget(self.clear_ab_button)
+        controls.addWidget(self.download_preview_button)
         controls.addWidget(self.fullscreen_button)
         controls.addStretch(1)
 
@@ -457,6 +464,8 @@ class MainWindow(QMainWindow):
             self.status_label.setText(str(exc))
             return
 
+        self._preview_url = url
+        self._preview_kind = self._selected_value(self.KIND_COLUMN)
         self._loop_a = None
         self._loop_b = None
         self._update_ab_label()
@@ -632,14 +641,27 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def download_selected(self) -> None:
-        if self._download_thread and self._download_thread.isRunning():
-            QMessageBox.information(self, "Descarga en curso", "Espera a que termine la descarga actual.")
-            return
-
         url = self._selected_url()
         kind = self._selected_value(self.KIND_COLUMN)
         if not url or not kind:
             QMessageBox.information(self, "Selecciona un video", "Selecciona una fila primero.")
+            return
+        self._start_download(url, kind)
+
+    @Slot()
+    def download_preview(self) -> None:
+        if not self._preview_url or not self._preview_kind:
+            QMessageBox.information(
+                self,
+                "Sin video en previsualización",
+                "Previsualiza un video antes de descargarlo desde el reproductor.",
+            )
+            return
+        self._start_download(self._preview_url, self._preview_kind)
+
+    def _start_download(self, url: str, kind: str) -> None:
+        if self._download_thread and self._download_thread.isRunning():
+            QMessageBox.information(self, "Descarga en curso", "Espera a que termine la descarga actual.")
             return
 
         parsed_name = Path(unquote(urlparse(url).path)).name
@@ -664,8 +686,9 @@ class MainWindow(QMainWindow):
         self._download_dialog.setMinimumDuration(0)
         self._download_dialog.setValue(0)
 
+        referer = self.url_input.text().strip() or None
         self._download_thread = QThread(self)
-        self._download_worker = DownloadWorker(url, destination, kind)
+        self._download_worker = DownloadWorker(url, destination, kind, referer)
         self._download_worker.moveToThread(self._download_thread)
         self._download_thread.started.connect(self._download_worker.run)
         self._download_worker.progress.connect(self._download_progress)
