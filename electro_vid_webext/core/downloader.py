@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -85,6 +86,39 @@ def _validate_download(path: Path, content_type: str = "") -> None:
         raise RuntimeError(
             f"El servidor devolvió {content_type or 'contenido no multimedia'} en vez del video."
         )
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return
+
+    completed = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("El archivo recibido no es un video válido según FFprobe.")
+
+    try:
+        data = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("FFprobe no pudo validar el archivo descargado.") from exc
+
+    if not data.get("streams"):
+        raise RuntimeError("El archivo descargado no contiene una pista de video.")
 
 
 def _download_direct(
