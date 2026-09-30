@@ -50,7 +50,7 @@ class _MediaHTMLParser(HTMLParser):
                     self.candidates.append((values["content"], f"<meta {prop}>"))
 
 
-def _kind_from_url(url: str) -> str | None:
+def mediamedia_kind_from_url(url: str) -> str | None:
     path = urlparse(url).path.lower()
     for extension, kind in MEDIA_EXTENSIONS.items():
         if path.endswith(extension):
@@ -87,9 +87,9 @@ def detect_video_sources(page_url: str, timeout: float = 15.0) -> list[VideoSour
 
     with urlopen(request, timeout=timeout) as response:
         content_type = response.headers.get_content_type()
-        if content_type.startswith("video/") or _kind_from_url(response.geturl()):
+        if content_type.startswith("video/") or media_kind_from_url(response.geturl()):
             final_url = response.geturl()
-            return [VideoSource(final_url, _kind_from_url(final_url) or content_type, "URL directa")]
+            return [VideoSource(final_url, media_kind_from_url(final_url) or content_type, "URL directa")]
 
         charset = response.headers.get_content_charset() or "utf-8"
         raw = response.read(8 * 1024 * 1024)
@@ -107,7 +107,7 @@ def detect_video_sources(page_url: str, timeout: float = 15.0) -> list[VideoSour
         normalized = _normalize_url(candidate, final_page_url)
         if not normalized:
             continue
-        kind = _kind_from_url(normalized)
+        kind = media_kind_from_url(normalized)
         if not kind:
             continue
         found.setdefault(normalized, VideoSource(normalized, kind, origin))
