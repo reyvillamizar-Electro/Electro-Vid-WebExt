@@ -162,8 +162,31 @@ class MPVController:
             raise MPVError(str(response.get("error")))
         return response.get("data")
 
-    def load(self, url: str) -> None:
-        self.command("loadfile", url, "replace")
+    def load(
+        self,
+        url: str,
+        *,
+        referer: str | None = None,
+        user_agent: str | None = None,
+        cookie_header: str | None = None,
+        origin_header: str | None = None,
+    ) -> None:
+        options: dict[str, Any] = {"hls-bitrate": "max"}
+
+        if user_agent:
+            options["user-agent"] = user_agent
+
+        header_fields: list[str] = []
+        if referer:
+            header_fields.append(f"Referer: {referer}")
+        if cookie_header:
+            header_fields.append(f"Cookie: {cookie_header}")
+        if origin_header:
+            header_fields.append(f"Origin: {origin_header}")
+        if header_fields:
+            options["http-header-fields"] = header_fields
+
+        self.command("loadfile", url, "replace", -1, options)
 
     def toggle_pause(self) -> None:
         self.command("cycle", "pause")
