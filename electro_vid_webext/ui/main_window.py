@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PySide6.QtCore import QObject, QThread, QUrl, Signal, Slot
 from PySide6.QtGui import QGuiApplication
@@ -45,6 +46,7 @@ class AnalysisWorker(QObject):
 
 class MetadataWorker(QObject):
     item_ready = Signal(str, object)
+    progress = Signal(int, int)
     finished = Signal()
 
     def __init__(self, sources: list[VideoSource]) -> None:
@@ -53,12 +55,30 @@ class MetadataWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        for source in self.sources:
-            try:
-                metadata = read_media_metadata(source.url)
-            except Exception:
-                metadata = MediaMetadata()
-            self.item_ready.emit(source.url, metadata)
+        total = len(self.sources)
+        if total == 0:
+            self.finished.emit()
+            return
+
+        max_workers = min(3, total)
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="metadata") as executor:
+            future_by_url = {
+                executor.submit(read_media_metadata, source.url): source.url
+                for source in self.sources
+            }
+
+            completed = 0
+            for future in as_completed(future_by_url):
+                url = future_by_url[future]
+                try:
+                    metadata = future.result()
+                except Exception:
+                    metadata = MediaMetadata()
+
+                completed += 1
+                self.item_ready.emit(url, metadata)
+                self.progress.emit(completed, total)
+
         self.finished.emit()
 
 
@@ -254,6 +274,7 @@ class MainWindow(QMainWindow):
         self._metadata_worker.moveToThread(self._metadata_thread)
         self._metadata_thread.started.connect(self._metadata_worker.run)
         self._metadata_worker.item_ready.connect(self._metadata_ready)
+        self._metadata_worker.progress.connect(self._metadata_progress)
         self._metadata_worker.finished.connect(self._metadata_thread.quit)
         self._metadata_thread.finished.connect(self._metadata_worker.deleteLater)
         self._metadata_thread.finished.connect(self._metadata_thread.deleteLater)
@@ -268,6 +289,12 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, 1, QTableWidgetItem(metadata.duration))
         self.table.setItem(row, 2, QTableWidgetItem(metadata.quality))
         self.table.setItem(row, 3, QTableWidgetItem(metadata.size))
+
+    @Slot(int, int)
+    def _metadata_progress(self, completed: int, total: int) -> None:
+        self.status_label.setText(
+            f"{len(self._sources)} fuente(s) encontrada(s). Metadatos {completed}/{total}…"
+        )
 
     @Slot()
     def _metadata_finished(self) -> None:
