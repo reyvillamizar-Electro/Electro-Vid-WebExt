@@ -65,11 +65,35 @@ def _quality_label(width: int | None, height: int | None) -> str:
     return f"{height}p"
 
 
-def _http_size(url: str, timeout: float = 8.0) -> int | None:
+def _request_headers(
+    referer: str | None,
+    user_agent: str | None,
+    cookie_header: str | None,
+    origin_header: str | None,
+) -> dict[str, str]:
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "User-Agent": user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "*/*",
     }
+    if referer:
+        headers["Referer"] = referer
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    if origin_header:
+        headers["Origin"] = origin_header
+    return headers
+
+
+def _http_size(
+    url: str,
+    timeout: float = 8.0,
+    *,
+    referer: str | None = None,
+    user_agent: str | None = None,
+    cookie_header: str | None = None,
+    origin_header: str | None = None,
+) -> int | None:
+    headers = _request_headers(referer, user_agent, cookie_header, origin_header)
     try:
         request = Request(url, headers=headers, method="HEAD")
         with urlopen(request, timeout=timeout) as response:
@@ -100,6 +124,11 @@ def _http_size(url: str, timeout: float = 8.0) -> int | None:
 def _probe_with_ffprobe(
     url: str,
     timeout: float = 20.0,
+    *,
+    referer: str | None = None,
+    user_agent: str | None = None,
+    cookie_header: str | None = None,
+    origin_header: str | None = None,
 ) -> tuple[float | None, str, str, str]:
     executable = shutil.which("ffprobe")
     if not executable:
@@ -109,12 +138,28 @@ def _probe_with_ffprobe(
         executable,
         "-v",
         "error",
+    ]
+
+    if user_agent:
+        command.extend(["-user_agent", user_agent])
+    if referer:
+        command.extend(["-referer", referer])
+
+    extra_headers: list[str] = []
+    if cookie_header:
+        extra_headers.append(f"Cookie: {cookie_header}")
+    if origin_header:
+        extra_headers.append(f"Origin: {origin_header}")
+    if extra_headers:
+        command.extend(["-headers", "\r\n".join(extra_headers) + "\r\n"])
+
+    command.extend([
         "-show_entries",
         "format=duration:stream=codec_type,codec_name,width,height",
         "-of",
         "json",
         url,
-    ]
+    ])
 
     try:
         completed = subprocess.run(
@@ -190,9 +235,28 @@ def _metadata_from_url(url: str) -> tuple[str, str]:
     return "—", "—"
 
 
-def read_media_metadata(url: str) -> MediaMetadata:
-    size = _http_size(url)
-    duration, quality, resolution, codec = _probe_with_ffprobe(url)
+def read_media_metadata(
+    url: str,
+    *,
+    referer: str | None = None,
+    user_agent: str | None = None,
+    cookie_header: str | None = None,
+    origin_header: str | None = None,
+) -> MediaMetadata:
+    size = _http_size(
+        url,
+        referer=referer,
+        user_agent=user_agent,
+        cookie_header=cookie_header,
+        origin_header=origin_header,
+    )
+    duration, quality, resolution, codec = _probe_with_ffprobe(
+        url,
+        referer=referer,
+        user_agent=user_agent,
+        cookie_header=cookie_header,
+        origin_header=origin_header,
+    )
 
     if quality == "—" and resolution == "—":
         quality, resolution = _metadata_from_url(url)
