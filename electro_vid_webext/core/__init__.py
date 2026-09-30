@@ -1,0 +1,1 @@
+"""Core video detection utilities."""
