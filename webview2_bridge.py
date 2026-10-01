@@ -493,6 +493,135 @@ def main() -> int:
                     for frame in frames:
                         emit("iframe", url=frame, from_url=current)
                     emit_media_snapshot(window, state)
+                elif action == "prepare_recording":
+                    script = """
+                    (async () => {
+                      const result = {
+                        played: false,
+                        quality: '',
+                        backend: 'html5',
+                        detail: ''
+                      };
+
+                      try {
+                        if (typeof window.jwplayer === 'function') {
+                          let player = null;
+                          try {
+                            player = window.jwplayer();
+                          } catch (_) {}
+
+                          if (player) {
+                            result.backend = 'jwplayer';
+
+                            try {
+                              const levels = player.getQualityLevels?.() || [];
+                              if (levels.length) {
+                                let bestIndex = 0;
+                                let bestScore = -1;
+
+                                levels.forEach((level, index) => {
+                                  const label = String(level?.label || '');
+                                  const heightMatch = label.match(/(\\d{3,4})\\s*p/i);
+                                  const height = heightMatch
+                                    ? Number(heightMatch[1])
+                                    : Number(level?.height || 0);
+                                  const width = Number(level?.width || 0);
+                                  const bitrate = Number(
+                                    level?.bitrate
+                                    || level?.bandwidth
+                                    || 0
+                                  );
+
+                                  const score =
+                                    (height * 1000000000)
+                                    + (width * 1000000)
+                                    + bitrate;
+
+                                  if (score > bestScore) {
+                                    bestScore = score;
+                                    bestIndex = index;
+                                  }
+                                });
+
+                                try {
+                                  player.setCurrentQuality(bestIndex);
+                                  const best = levels[bestIndex] || {};
+                                  result.quality = String(
+                                    best.label
+                                    || best.height
+                                    || ('nivel ' + bestIndex)
+                                  );
+                                } catch (_) {}
+                              }
+                            } catch (_) {}
+
+                            try {
+                              player.play(true);
+                              result.played = true;
+                              result.detail = 'Play enviado por JW Player API';
+                            } catch (_) {}
+                          }
+                        }
+
+                        if (!result.played) {
+                          const videos = Array.from(
+                            document.querySelectorAll('video')
+                          ).sort(
+                            (a, b) =>
+                              (b.clientWidth * b.clientHeight)
+                              - (a.clientWidth * a.clientHeight)
+                          );
+
+                          const video = videos[0];
+                          if (video) {
+                            result.backend = 'html5';
+                            try {
+                              await video.play();
+                              result.played = !video.paused;
+                              result.detail = 'Play enviado al elemento <video>';
+                            } catch (error) {
+                              result.detail = String(error);
+                            }
+                          } else {
+                            result.detail = 'No se encontró un reproductor controlable.';
+                          }
+                        }
+                      } catch (error) {
+                        result.detail = String(error);
+                      }
+
+                      return JSON.stringify(result);
+                    })();
+                    """
+
+                    raw_result = window.evaluate_js(script)
+                    if isinstance(raw_result, str):
+                        try:
+                            result = json.loads(raw_result)
+                        except json.JSONDecodeError:
+                            result = {
+                                "played": False,
+                                "quality": "",
+                                "backend": "",
+                                "detail": raw_result,
+                            }
+                    elif isinstance(raw_result, dict):
+                        result = raw_result
+                    else:
+                        result = {
+                            "played": False,
+                            "quality": "",
+                            "backend": "",
+                            "detail": "Respuesta inválida del reproductor.",
+                        }
+
+                    emit(
+                        "player_control",
+                        played=bool(result.get("played")),
+                        quality=str(result.get("quality") or ""),
+                        backend=str(result.get("backend") or ""),
+                        detail=str(result.get("detail") or ""),
+                    )
                 elif action == "close":
                     window.destroy()
                     return
