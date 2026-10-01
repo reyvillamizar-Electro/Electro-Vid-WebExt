@@ -176,6 +176,7 @@ class BrowserView(QWebEngineView):
         self._initial_url = ""
         self._last_url = ""
         self._embedded_seen: set[str] = set()
+        self._shutting_down = False
 
         # Clear data from the older versions that used Qt's default profile.
         # This profile is not used for browsing anymore.
@@ -276,6 +277,7 @@ class BrowserView(QWebEngineView):
 
     def shutdown(self) -> None:
         """Stop web activity before the main window is destroyed."""
+        self._shutting_down = True
         try:
             self.stop()
         except Exception:
@@ -531,6 +533,8 @@ class BrowserView(QWebEngineView):
         self.page_ready.emit()
 
     def rescan_dom(self) -> None:
+        if self._shutting_down:
+            return
         script = """
         (() => {
           const media = new Set();
@@ -581,6 +585,8 @@ class BrowserView(QWebEngineView):
         self.page().runJavaScript(script, self._consume_dom_results)
 
     def _consume_dom_results(self, values) -> None:
+        if self._shutting_down:
+            return
         if not isinstance(values, dict):
             return
 
