@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from electro_vid_webext.core.detector import VideoSource, detect_video_sources, media_kind_from_url
-from electro_vid_webext.core.downloader import download_media, suggested_extension
+from electro_vid_webext.core.downloader import DownloadCancelled, download_media, suggested_extension
 from electro_vid_webext.core.manifest import inspect_manifest
 from electro_vid_webext.core.metadata import MediaMetadata, ffprobe_available, read_media_metadata
 from electro_vid_webext.core.mpv_player import MPVController, MPVError
@@ -165,7 +165,10 @@ class DownloadWorker(QObject):
                 user_agent=self.source.user_agent,
                 cookie_header=self.source.cookie_header,
                 origin_header=self.source.origin_header,
+                cancelled=lambda: QThread.currentThread().isInterruptionRequested(),
             )
+        except DownloadCancelled:
+            self.failed.emit("Descarga cancelada.")
         except Exception as exc:
             self.failed.emit(str(exc))
         else:
@@ -1194,6 +1197,11 @@ class MainWindow(QMainWindow):
     def _download_failed(self, message: str) -> None:
         if self._download_dialog is not None:
             self._download_dialog.close()
+
+        if self._closing and message == "Descarga cancelada.":
+            self.status_label.setText("Cerrando…")
+            return
+
         self.status_label.setText("La descarga falló.")
         QMessageBox.warning(self, "Error de descarga", message)
 
