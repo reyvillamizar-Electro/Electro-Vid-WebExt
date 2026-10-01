@@ -242,7 +242,9 @@ class BrowserView(QWebEngineView):
         )
         self.profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
         self.setPage(QuietWebEnginePage(self.profile, self))
+        self._media_compatibility_enabled = True
         self._install_credential_blocker()
+        self._install_media_compatibility_shim()
 
         self.interceptor = MediaRequestInterceptor(self)
         self.interceptor.media_found.connect(self._on_network_media)
@@ -316,6 +318,141 @@ class BrowserView(QWebEngineView):
             """
         )
         self.page().scripts().insert(script)
+
+    def _install_media_compatibility_shim(self) -> None:
+        script = QWebEngineScript()
+        script.setName("ElectroVidWebExt.MediaCompatibility")
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        script.setRunsOnSubFrames(True)
+        script.setSourceCode(
+            """
+            (() => {
+              if (window.__ELECTRO_MEDIA_COMPAT_INSTALLED__) {
+                window.__ELECTRO_MEDIA_COMPAT__ = true;
+                return;
+              }
+
+              window.__ELECTRO_MEDIA_COMPAT_INSTALLED__ = true;
+              window.__ELECTRO_MEDIA_COMPAT__ = true;
+
+              const targetType = (value) => {
+                const type = String(value || '').toLowerCase();
+                if (!type) return false;
+
+                const isH264 =
+                  type.includes('video/mp4') &&
+                  (type.includes('avc1') || type.includes('avc3'));
+
+                const isAac =
+                  (type.includes('audio/mp4') || type.includes('video/mp4')) &&
+                  type.includes('mp4a');
+
+                return isH264 || isAac;
+              };
+
+              try {
+                const originalCanPlayType =
+                  HTMLMediaElement.prototype.canPlayType;
+
+                Object.defineProperty(
+                  HTMLMediaElement.prototype,
+                  'canPlayType',
+                  {
+                    configurable: true,
+                    writable: true,
+                    value: function(type) {
+                      const actual = originalCanPlayType.call(this, type);
+                      if (actual) return actual;
+                      if (
+                        window.__ELECTRO_MEDIA_COMPAT__ &&
+                        targetType(type)
+                      ) {
+                        return 'probably';
+                      }
+                      return actual;
+                    }
+                  }
+                );
+              } catch (_) {}
+
+              try {
+                if (window.MediaSource && MediaSource.isTypeSupported) {
+                  const originalIsTypeSupported =
+                    MediaSource.isTypeSupported.bind(MediaSource);
+
+                  MediaSource.isTypeSupported = function(type) {
+                    const actual = originalIsTypeSupported(type);
+                    if (actual) return true;
+                    if (
+                      window.__ELECTRO_MEDIA_COMPAT__ &&
+                      targetType(type)
+                    ) {
+                      return true;
+                    }
+                    return false;
+                  };
+                }
+              } catch (_) {}
+
+              try {
+                if (
+                  navigator.mediaCapabilities &&
+                  navigator.mediaCapabilities.decodingInfo
+                ) {
+                  const originalDecodingInfo =
+                    navigator.mediaCapabilities.decodingInfo.bind(
+                      navigator.mediaCapabilities
+                    );
+
+                  navigator.mediaCapabilities.decodingInfo =
+                    async function(config) {
+                      const actual = await originalDecodingInfo(config);
+                      if (!window.__ELECTRO_MEDIA_COMPAT__) return actual;
+
+                      const videoType =
+                        config && config.video
+                          ? config.video.contentType
+                          : '';
+                      const audioType =
+                        config && config.audio
+                          ? config.audio.contentType
+                          : '';
+
+                      if (
+                        !actual.supported &&
+                        (targetType(videoType) || targetType(audioType))
+                      ) {
+                        return {
+                          supported: true,
+                          smooth: false,
+                          powerEfficient: false
+                        };
+                      }
+                      return actual;
+                    };
+                }
+              } catch (_) {}
+            })();
+            """
+        )
+        self.page().scripts().insert(script)
+
+    def set_media_compatibility(self, enabled: bool) -> None:
+        self._media_compatibility_enabled = bool(enabled)
+        value = "true" if enabled else "false"
+        script = (
+            "window.__ELECTRO_MEDIA_COMPAT__ = "
+            + value
+            + ";"
+        )
+        try:
+            self.page().runJavaScript(script)
+        except Exception:
+            pass
+
+    def media_compatibility_enabled(self) -> bool:
+        return self._media_compatibility_enabled
 
     def shutdown(self) -> None:
         """Stop web activity before the main window is destroyed."""
@@ -444,6 +581,12 @@ class BrowserView(QWebEngineView):
         # the target but does not allow arbitrary popups to take over the UI.
 
     def _on_load_started(self) -> None:
+        QTimer.singleShot(
+            0,
+            lambda: self.set_media_compatibility(
+                self._media_compatibility_enabled
+            ),
+        )
         requested = ""
         try:
             requested = self.page().requestedUrl().toString()
@@ -581,6 +724,7 @@ class BrowserView(QWebEngineView):
 
         if not ok:
             return
+        self.set_media_compatibility(self._media_compatibility_enabled)
         self.rescan_dom()
         QTimer.singleShot(1000, self.rescan_dom)
         QTimer.singleShot(3000, self.rescan_dom)
