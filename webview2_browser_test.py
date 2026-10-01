@@ -27,6 +27,87 @@ def log_request(request) -> None:
         print("[MEDIA]", url)
 
 
+def install_ghost_popup(window: webview.Window) -> None:
+    try:
+        window.run_js(
+            """
+            (() => {
+              if (window.__ELECTRO_GHOST_POPUP__) return;
+              window.__ELECTRO_GHOST_POPUP__ = true;
+
+              const frame = document.createElement('iframe');
+              frame.src = 'about:blank';
+              frame.setAttribute('aria-hidden', 'true');
+              frame.tabIndex = -1;
+              frame.style.cssText = [
+                'position:fixed',
+                'left:-10000px',
+                'top:-10000px',
+                'width:1px',
+                'height:1px',
+                'opacity:0',
+                'pointer-events:none',
+                'border:0'
+              ].join(';');
+              document.documentElement.appendChild(frame);
+
+              const ghost = frame.contentWindow;
+              if (!ghost) return;
+
+              try {
+                ghost.focus = () => {};
+                ghost.blur = () => {};
+              } catch (_) {}
+
+              window.open = function(url, target, features) {
+                try {
+                  console.warn(
+                    '[Electro Test] popup fantasma:',
+                    String(url || '')
+                  );
+                } catch (_) {}
+
+                // Keep a real WindowProxy alive but do not navigate it to the
+                // advertising URL. This avoids a visible popup while giving
+                // scripts a genuine window-like return value.
+                try {
+                  if (ghost.closed) {
+                    return null;
+                  }
+                } catch (_) {}
+
+                return ghost;
+              };
+
+              document.addEventListener(
+                'click',
+                (event) => {
+                  const element = event.target instanceof Element
+                    ? event.target.closest('a[target="_blank"]')
+                    : null;
+                  if (!element) return;
+
+                  // Do not let target=_blank links escape to the system
+                  // browser. The site's window.open path receives the ghost.
+                  event.preventDefault();
+                  event.stopPropagation();
+                  try {
+                    console.warn(
+                      '[Electro Test] target=_blank contenido:',
+                      element.href || ''
+                    );
+                  } catch (_) {}
+                },
+                true
+              );
+            })();
+            """
+        )
+        print("[GHOST] bloqueo de popups activo en el reproductor")
+    except Exception as exc:
+        print(f"[GHOST] no se pudo instalar: {exc}")
+
+
 def media_snapshot(window: webview.Window) -> list[str]:
     try:
         raw = window.evaluate_js(
@@ -255,6 +336,10 @@ def main() -> int:
                 player_depth += 1
                 print(f"[PLAYER {player_depth}]", player)
                 window.load_url(player)
+                return
+
+        if auto_player and player_depth >= 2:
+            install_ghost_popup(window)
 
     window.events.loaded += on_loaded
     window.events.request_sent += log_request
@@ -262,14 +347,14 @@ def main() -> int:
     # For this diagnostic, do not alter the site's popup/player flow.
     # New-window links may open in the system browser so the WebView2 player
     # page remains intact while we verify actual media playback.
-    webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
+    webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = False
     webview.settings["ALLOW_DOWNLOADS"] = False
     webview.settings["IGNORE_SSL_ERRORS"] = False
 
     print("Abriendo prueba aislada con Microsoft Edge WebView2…")
     print("URL:", url)
     if "--player" in sys.argv[2:]:
-        print("Modo --player: seguirá automáticamente la cadena de iframes del reproductor.")
+        print("Modo --player: seguirá la cadena de iframes y activará popup fantasma en el player.")
     else:
         print("Se mostrarán los [IFRAME] detectados sin cambiar de página.")
     print("Cierra esta ventana para volver a PowerShell.")
