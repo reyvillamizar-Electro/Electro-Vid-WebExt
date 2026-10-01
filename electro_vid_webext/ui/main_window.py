@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
 
 from electro_vid_webext.core.detector import VideoSource, detect_video_sources, media_kind_from_url
 from electro_vid_webext.core.downloader import download_media, suggested_extension
+from electro_vid_webext.core.manifest import inspect_manifest
 from electro_vid_webext.core.metadata import MediaMetadata, ffprobe_available, read_media_metadata
 from electro_vid_webext.core.mpv_player import MPVController, MPVError
 from electro_vid_webext.ui.browser_view import BrowserView
@@ -84,7 +86,14 @@ class MetadataWorker(QObject):
         max_workers = min(3, total)
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="metadata") as executor:
             future_by_url = {
-                executor.submit(read_media_metadata, source.url): source.url
+                executor.submit(
+                    read_media_metadata,
+                    source.url,
+                    referer=source.referer,
+                    user_agent=source.user_agent,
+                    cookie_header=source.cookie_header,
+                    origin_header=source.origin_header,
+                ): source.url
                 for source in self.sources
             }
 
@@ -103,27 +112,59 @@ class MetadataWorker(QObject):
         self.finished.emit()
 
 
+class ManifestWorker(QObject):
+    result_ready = Signal(object, object, str)
+    finished = Signal()
+
+    def __init__(self, sources: list[VideoSource]) -> None:
+        super().__init__()
+        self.sources = sources
+
+    @Slot()
+    def run(self) -> None:
+        if not self.sources:
+            self.finished.emit()
+            return
+
+        max_workers = min(3, len(self.sources))
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="manifest") as executor:
+            future_by_source = {
+                executor.submit(inspect_manifest, source): source
+                for source in self.sources
+            }
+            for future in as_completed(future_by_source):
+                source = future_by_source[future]
+                try:
+                    variants, protection = future.result()
+                except Exception:
+                    variants, protection = [], source.protection
+                self.result_ready.emit(source, variants, protection)
+
+        self.finished.emit()
+
+
 class DownloadWorker(QObject):
     progress = Signal(int)
     finished = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, url: str, destination: str, kind: str, referer: str | None) -> None:
+    def __init__(self, source: VideoSource, destination: str) -> None:
         super().__init__()
-        self.url = url
+        self.source = source
         self.destination = destination
-        self.kind = kind
-        self.referer = referer
 
     @Slot()
     def run(self) -> None:
         try:
             download_media(
-                self.url,
+                self.source.url,
                 self.destination,
-                self.kind,
+                self.source.kind,
                 progress=self.progress.emit,
-                referer=self.referer,
+                referer=self.source.referer,
+                user_agent=self.source.user_agent,
+                cookie_header=self.source.cookie_header,
+                origin_header=self.source.origin_header,
             )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -138,8 +179,9 @@ class MainWindow(QMainWindow):
     RESOLUTION_COLUMN = 3
     CODEC_COLUMN = 4
     SIZE_COLUMN = 5
-    ORIGIN_COLUMN = 6
-    URL_COLUMN = 7
+    PROTECTION_COLUMN = 6
+    ORIGIN_COLUMN = 7
+    URL_COLUMN = 8
 
     def __init__(self) -> None:
         super().__init__()
@@ -151,18 +193,23 @@ class MainWindow(QMainWindow):
         self._analysis_worker: AnalysisWorker | None = None
         self._metadata_thread: QThread | None = None
         self._metadata_worker: MetadataWorker | None = None
+        self._manifest_thread: QThread | None = None
+        self._manifest_worker: ManifestWorker | None = None
         self._download_thread: QThread | None = None
         self._download_worker: DownloadWorker | None = None
         self._download_dialog: QProgressDialog | None = None
 
         self._sources: list[VideoSource] = []
         self._known_urls: set[str] = set()
+        self._source_by_url: dict[str, VideoSource] = {}
         self._pending_metadata: dict[str, VideoSource] = {}
+        self._pending_manifests: dict[str, VideoSource] = {}
 
         self._mpv: MPVController | None = None
         self._preview_loaded = False
         self._preview_url: str | None = None
         self._preview_kind: str | None = None
+        self._preview_source: VideoSource | None = None
         self._duration_seconds = 0.0
         self._loop_a: float | None = None
         self._loop_b: float | None = None
@@ -234,16 +281,16 @@ class MainWindow(QMainWindow):
         self.filter_input.setPlaceholderText("Escribe para filtrar resultados…")
         self.filter_column = QComboBox()
         self.filter_column.addItems(
-            ["Todas", "Tipo", "Duración", "Calidad", "Resolución", "Codec", "Tamaño", "Detectado en", "URL"]
+            ["Todas", "Tipo", "Duración", "Calidad", "Resolución", "Codec", "Tamaño", "Protección", "Detectado en", "URL"]
         )
         self.filter_input.textChanged.connect(self._apply_table_filter)
         self.filter_column.currentIndexChanged.connect(self._apply_table_filter)
         filter_row.addWidget(self.filter_input, 1)
         filter_row.addWidget(self.filter_column)
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
-            ["Tipo", "Duración", "Calidad", "Resolución", "Codec", "Tamaño", "Detectado en", "URL"]
+            ["Tipo", "Duración", "Calidad", "Resolución", "Codec", "Tamaño", "Protección", "Detectado en", "URL"]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -257,7 +304,7 @@ class MainWindow(QMainWindow):
         header.setStretchLastSection(False)
         header.setMinimumSectionSize(70)
 
-        widths = [90, 95, 105, 125, 130, 105, 190, 650]
+        widths = [90, 95, 105, 125, 130, 105, 145, 190, 650]
         for column, width in enumerate(widths):
             self.table.setColumnWidth(column, width)
 
@@ -433,7 +480,9 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
         self._sources = []
         self._known_urls = set()
+        self._source_by_url = {}
         self._pending_metadata = {}
+        self._pending_manifests = {}
         self.analyze_button.setEnabled(False)
         self.status_label.setText("Analizando página y cargando navegador…")
         self.browser.load_page(url)
@@ -463,6 +512,7 @@ class MainWindow(QMainWindow):
             )
             if self.table.rowCount() > 0:
                 self.table.selectRow(0)
+            self._scan_pending_manifests()
             self._scan_pending_metadata()
         else:
             self.status_label.setText(
@@ -471,44 +521,92 @@ class MainWindow(QMainWindow):
             self.analyze_button.setEnabled(True)
 
     def _add_source(self, source: VideoSource) -> bool:
-        if not source.url or source.url in self._known_urls:
+        if not source.url:
+            return False
+
+        if source.url in self._known_urls:
+            existing = self._source_by_url.get(source.url)
+            if existing is not None:
+                enriched = replace(
+                    existing,
+                    referer=source.referer or existing.referer,
+                    user_agent=source.user_agent or existing.user_agent,
+                    cookie_header=source.cookie_header or existing.cookie_header,
+                    origin_header=source.origin_header or existing.origin_header,
+                    quality_hint=(
+                        source.quality_hint
+                        if source.quality_hint != "—"
+                        else existing.quality_hint
+                    ),
+                    resolution_hint=(
+                        source.resolution_hint
+                        if source.resolution_hint != "—"
+                        else existing.resolution_hint
+                    ),
+                    protection=(
+                        source.protection
+                        if source.protection != "—"
+                        else existing.protection
+                    ),
+                )
+                if enriched != existing:
+                    self._source_by_url[source.url] = enriched
+                    self._pending_metadata[source.url] = enriched
+                    if enriched.kind.upper() in {"HLS", "DASH"}:
+                        self._pending_manifests[source.url] = enriched
             return False
 
         self._known_urls.add(source.url)
         self._sources.append(source)
+        self._source_by_url[source.url] = source
         self._pending_metadata[source.url] = source
+        if source.kind.upper() in {"HLS", "DASH"}:
+            self._pending_manifests[source.url] = source
 
         sorting = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
         row = self.table.rowCount()
         self.table.insertRow(row)
+
+        quality = source.quality_hint if source.quality_hint != "—" else "…"
+        resolution = source.resolution_hint if source.resolution_hint != "—" else "…"
+        protection = source.protection if source.protection != "—" else "—"
+
         values = [
             source.kind,
             "…",
+            quality,
+            resolution,
             "…",
             "…",
-            "…",
-            "…",
+            protection,
             source.origin,
             source.url,
         ]
         for column, value in enumerate(values):
-            self.table.setItem(row, column, SortItem(value, -1 if value == "…" else value.lower()))
+            self.table.setItem(
+                row,
+                column,
+                SortItem(value, -1 if value == "…" else value.lower()),
+            )
+
         self.table.setSortingEnabled(sorting)
         self._apply_table_filter()
         return True
 
-    @Slot(str, str)
-    def _dynamic_media_found(self, url: str, origin: str) -> None:
-        kind = media_kind_from_url(url)
-        if not kind:
+    @Slot(object)
+    def _dynamic_media_found(self, source: object) -> None:
+        if not isinstance(source, VideoSource):
             return
 
-        if self._add_source(VideoSource(url=url, kind=kind, origin=origin)):
+        was_new = self._add_source(source)
+        if was_new:
             self.status_label.setText(
                 f"{len(self._sources)} fuente(s) detectada(s). Nueva fuente capturada por navegador."
             )
-            QTimer.singleShot(250, self._scan_pending_metadata)
+
+        QTimer.singleShot(150, self._scan_pending_manifests)
+        QTimer.singleShot(250, self._scan_pending_metadata)
 
     def _scan_pending_metadata(self) -> None:
         if self._metadata_thread and self._metadata_thread.isRunning():
@@ -519,6 +617,64 @@ class MainWindow(QMainWindow):
         batch = list(self._pending_metadata.values())
         self._pending_metadata.clear()
         self._start_metadata_scan(batch)
+
+    def _scan_pending_manifests(self) -> None:
+        if self._manifest_thread and self._manifest_thread.isRunning():
+            return
+        if not self._pending_manifests:
+            return
+
+        batch = list(self._pending_manifests.values())
+        self._pending_manifests.clear()
+
+        self._manifest_thread = QThread(self)
+        self._manifest_worker = ManifestWorker(batch)
+        self._manifest_worker.moveToThread(self._manifest_thread)
+        self._manifest_thread.started.connect(self._manifest_worker.run)
+        self._manifest_worker.result_ready.connect(self._manifest_result_ready)
+        self._manifest_worker.finished.connect(self._manifest_thread.quit)
+        self._manifest_thread.finished.connect(self._manifest_worker.deleteLater)
+        self._manifest_thread.finished.connect(self._manifest_thread.deleteLater)
+        self._manifest_thread.finished.connect(self._manifest_finished)
+        self._manifest_thread.start()
+
+    @Slot(object, object, str)
+    def _manifest_result_ready(
+        self,
+        parent: object,
+        variants: object,
+        protection: str,
+    ) -> None:
+        if not isinstance(parent, VideoSource):
+            return
+
+        current = self._source_by_url.get(parent.url, parent)
+        if protection and protection != current.protection:
+            current = replace(current, protection=protection)
+            self._source_by_url[parent.url] = current
+            row = self._row_for_url(parent.url)
+            if row is not None:
+                self.table.setItem(
+                    row,
+                    self.PROTECTION_COLUMN,
+                    SortItem(protection),
+                )
+
+        if isinstance(variants, list):
+            for variant in variants:
+                if isinstance(variant, VideoSource):
+                    self._add_source(variant)
+
+        self._apply_table_filter()
+
+    @Slot()
+    def _manifest_finished(self) -> None:
+        self._manifest_thread = None
+        self._manifest_worker = None
+        if self._pending_manifests:
+            QTimer.singleShot(100, self._scan_pending_manifests)
+        if self._pending_metadata:
+            QTimer.singleShot(150, self._scan_pending_metadata)
 
     def _start_metadata_scan(self, sources: list[VideoSource]) -> None:
         if self._metadata_thread and self._metadata_thread.isRunning():
@@ -545,11 +701,22 @@ class MainWindow(QMainWindow):
         sorting = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
 
+        source = self._source_by_url.get(url)
+        quality = metadata.quality
+        resolution = metadata.resolution
+        if source is not None:
+            if quality == "—" and source.quality_hint != "—":
+                quality = source.quality_hint
+            if resolution == "—" and source.resolution_hint != "—":
+                resolution = source.resolution_hint
+
         self.table.setItem(row, self.DURATION_COLUMN, SortItem(metadata.duration, self._duration_sort(metadata.duration)))
-        self.table.setItem(row, self.QUALITY_COLUMN, SortItem(metadata.quality, self._quality_sort(metadata.quality)))
-        self.table.setItem(row, self.RESOLUTION_COLUMN, SortItem(metadata.resolution, self._resolution_sort(metadata.resolution)))
+        self.table.setItem(row, self.QUALITY_COLUMN, SortItem(quality, self._quality_sort(quality)))
+        self.table.setItem(row, self.RESOLUTION_COLUMN, SortItem(resolution, self._resolution_sort(resolution)))
         self.table.setItem(row, self.CODEC_COLUMN, SortItem(metadata.codec))
         self.table.setItem(row, self.SIZE_COLUMN, SortItem(metadata.size, self._size_sort(metadata.size)))
+        if source is not None:
+            self.table.setItem(row, self.PROTECTION_COLUMN, SortItem(source.protection))
 
         self.table.setSortingEnabled(sorting)
         self._apply_table_filter()
@@ -657,16 +824,34 @@ class MainWindow(QMainWindow):
     def _selected_url(self) -> str | None:
         return self._selected_value(self.URL_COLUMN)
 
+    def _selected_source(self) -> VideoSource | None:
+        url = self._selected_url()
+        return self._source_by_url.get(url) if url else None
+
     @Slot()
     def preview_selected(self) -> None:
-        url = self._selected_url()
-        if not url:
+        source = self._selected_source()
+        if source is None:
             QMessageBox.information(self, "Selecciona un video", "Selecciona una fila primero.")
+            return
+
+        if source.protection.startswith("DRM"):
+            QMessageBox.warning(
+                self,
+                "Contenido protegido",
+                f"Se detectó {source.protection}. Electro Vid-WebExt no intenta eludir DRM.",
+            )
             return
 
         try:
             player = self._ensure_mpv()
-            player.load(url)
+            player.load(
+                source.url,
+                referer=source.referer,
+                user_agent=source.user_agent,
+                cookie_header=source.cookie_header,
+                origin_header=source.origin_header,
+            )
             player.set_file_loop(self.loop_button.isChecked())
             player.set_ab_loop(None, None)
         except MPVError as exc:
@@ -674,17 +859,18 @@ class MainWindow(QMainWindow):
             self.status_label.setText(str(exc))
             return
 
-        self._preview_url = url
-        self._preview_kind = self._selected_value(self.KIND_COLUMN)
+        self._preview_source = source
+        self._preview_url = source.url
+        self._preview_kind = source.kind
         self._loop_a = None
         self._loop_b = None
         self._update_ab_label()
         self._preview_loaded = True
-        self.preview_title.setText(url)
+        self.preview_title.setText(source.url)
         self.tabs.setCurrentIndex(1)
         self.play_button.setText("⏸ Pausar")
         self._player_timer.start()
-        self.status_label.setText("Reproduciendo con mpv.")
+        self.status_label.setText("Reproduciendo con mpv usando la sesión capturada.")
 
     @Slot()
     def toggle_playback(self) -> None:
@@ -851,25 +1037,34 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def download_selected(self) -> None:
-        url = self._selected_url()
-        kind = self._selected_value(self.KIND_COLUMN)
-        if not url or not kind:
+        source = self._selected_source()
+        if source is None:
             QMessageBox.information(self, "Selecciona un video", "Selecciona una fila primero.")
             return
-        self._start_download(url, kind)
+        self._start_download(source)
 
     @Slot()
     def download_preview(self) -> None:
-        if not self._preview_url or not self._preview_kind:
+        if self._preview_source is None:
             QMessageBox.information(
                 self,
                 "Sin video en previsualización",
                 "Previsualiza un video antes de descargarlo desde el reproductor.",
             )
             return
-        self._start_download(self._preview_url, self._preview_kind)
+        self._start_download(self._preview_source)
 
-    def _start_download(self, url: str, kind: str) -> None:
+    def _start_download(self, source: VideoSource) -> None:
+        if source.protection.startswith("DRM"):
+            QMessageBox.warning(
+                self,
+                "Contenido protegido",
+                f"Se detectó {source.protection}. La descarga no se intentará.",
+            )
+            return
+
+        url = source.url
+        kind = source.kind
         if self._download_thread and self._download_thread.isRunning():
             QMessageBox.information(self, "Descarga en curso", "Espera a que termine la descarga actual.")
             return
@@ -896,9 +1091,8 @@ class MainWindow(QMainWindow):
         self._download_dialog.setMinimumDuration(0)
         self._download_dialog.setValue(0)
 
-        referer = self.url_input.text().strip() or None
         self._download_thread = QThread(self)
-        self._download_worker = DownloadWorker(url, destination, kind, referer)
+        self._download_worker = DownloadWorker(source, destination)
         self._download_worker.moveToThread(self._download_thread)
         self._download_thread.started.connect(self._download_worker.run)
         self._download_worker.progress.connect(self._download_progress)
