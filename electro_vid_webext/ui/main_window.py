@@ -469,6 +469,32 @@ class MainWindow(QMainWindow):
 
         self.browser = BrowserView()
         self.browser.media_found.connect(self._dynamic_media_found)
+        self.browser.navigation_event.connect(self._browser_navigation_event)
+
+        self.navigation_table = QTableWidget(0, 4)
+        self.navigation_table.setHorizontalHeaderLabels(
+            ["Evento", "Desde", "Hacia", "Detalle"]
+        )
+        self.navigation_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.navigation_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.navigation_table.setHorizontalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+        self.navigation_table.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+        self.navigation_table.setAlternatingRowColors(True)
+        self.navigation_table.setShowGrid(False)
+        self.navigation_table.setMaximumHeight(190)
+
+        nav_header = self.navigation_table.horizontalHeader()
+        nav_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.navigation_table.setColumnWidth(0, 150)
+        self.navigation_table.setColumnWidth(1, 320)
+        self.navigation_table.setColumnWidth(2, 420)
+        self.navigation_table.setColumnWidth(3, 260)
 
         back_button.clicked.connect(self.browser.back)
         reload_button.clicked.connect(self.browser.reload)
@@ -482,7 +508,40 @@ class MainWindow(QMainWindow):
         layout.addLayout(controls)
         layout.addWidget(browser_note)
         layout.addWidget(self.browser, 1)
+        layout.addWidget(QLabel("Navegación detectada / redirecciones"))
+        layout.addWidget(self.navigation_table)
         return page
+
+    @Slot(object)
+    def _browser_navigation_event(self, event: object) -> None:
+        if not isinstance(event, dict):
+            return
+
+        row = self.navigation_table.rowCount()
+        self.navigation_table.insertRow(row)
+
+        values = [
+            str(event.get("event") or ""),
+            str(event.get("from") or ""),
+            str(event.get("to") or ""),
+            str(event.get("detail") or ""),
+        ]
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            item.setToolTip(value)
+            self.navigation_table.setItem(row, column, item)
+
+        self.navigation_table.scrollToBottom()
+
+        event_name = values[0]
+        if event_name == "Redirección":
+            self.status_label.setText(
+                f"Redirección detectada: {values[2]}"
+            )
+        elif event_name == "Popup / nueva ventana":
+            self.status_label.setText(
+                "La página intentó abrir otra ventana; se registró sin permitir que tome el control."
+            )
 
     def _ensure_mpv(self) -> MPVController:
         if self._mpv is not None:
@@ -510,6 +569,8 @@ class MainWindow(QMainWindow):
         self.stop_playback()
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
+        if hasattr(self, "navigation_table"):
+            self.navigation_table.setRowCount(0)
         self.table.setSortingEnabled(True)
         self._sources = []
         self._known_urls = set()
