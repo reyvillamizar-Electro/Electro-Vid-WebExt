@@ -94,7 +94,9 @@ Esto permite encontrar fuentes y variantes que no están presentes en el HTML in
 
 ### Sesión del navegador
 
-Cuando QtWebEngine captura una fuente, Electro Vid-WebExt conserva el contexto útil de esa petición (Referer, User-Agent, Origin y cookies aplicables) y lo reutiliza con mpv, FFprobe y FFmpeg cuando es posible. Esto mejora la compatibilidad con servidores que reproducen correctamente en el navegador pero rechazan peticiones externas sin sesión.
+Cuando QtWebEngine captura una fuente, Electro Vid-WebExt conserva temporalmente el contexto útil de esa petición (Referer, User-Agent, Origin y cookies aplicables) y lo reutiliza con mpv, FFprobe y FFmpeg cuando es posible. Esto mejora la compatibilidad con servidores que reproducen correctamente en el navegador pero rechazan peticiones externas sin sesión.
+
+El navegador integrado usa un perfil temporal/off-the-record: no persiste cookies ni permisos entre ejecuciones. También deniega permisos sensibles, bloquea selectores de archivos y ventanas emergentes, y cancela solicitudes WebAuth/passkey para evitar diálogos de autenticación ajenos a la extracción de video.
 
 ### Variantes HLS y protección
 
