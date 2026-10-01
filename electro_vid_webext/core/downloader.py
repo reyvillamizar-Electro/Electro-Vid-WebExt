@@ -948,6 +948,112 @@ def _download_with_ffmpeg(
 
             return_code, stderr = _run_ffmpeg(relaxed)
 
+            if (
+                return_code != 0
+                and (
+                    "dimensions not set" in stderr
+                    or "Could not write header" in stderr
+                )
+            ):
+                intermediate_ts = temp_target.with_suffix(".capture.ts")
+                intermediate_ts.unlink(missing_ok=True)
+
+                capture = prefix + maps + [
+                    "-sn",
+                    "-dn",
+                    "-c",
+                    "copy",
+                    "-f",
+                    "mpegts",
+                    str(intermediate_ts),
+                ]
+
+                if progress_details:
+                    progress_details(
+                        {
+                            "mode": "ffmpeg",
+                            "percent": -1,
+                            "bytes": None,
+                            "total_bytes": None,
+                            "speed_bps": None,
+                            "time_seconds": None,
+                            "duration_seconds": duration,
+                            "speed_factor": None,
+                            "message": (
+                                "El HLS no puede crear MP4 directamente; "
+                                "capturando primero a MPEG-TS sin recomprimir."
+                            ),
+                        }
+                    )
+
+                return_code, stderr = _run_ffmpeg(capture)
+
+                if return_code == 0 and intermediate_ts.exists():
+                    temp_target.unlink(missing_ok=True)
+
+                    remux = [
+                        ffmpeg,
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-analyzeduration",
+                        "100000000",
+                        "-probesize",
+                        "100000000",
+                        "-i",
+                        str(intermediate_ts),
+                        "-map",
+                        "0:V:0?",
+                        "-map",
+                        "0:a:0?",
+                        "-sn",
+                        "-dn",
+                        "-c",
+                        "copy",
+                        "-movflags",
+                        "+faststart",
+                        str(temp_target),
+                    ]
+
+                    if progress_details:
+                        progress_details(
+                            {
+                                "mode": "ffmpeg",
+                                "percent": -1,
+                                "bytes": (
+                                    intermediate_ts.stat().st_size
+                                    if intermediate_ts.exists()
+                                    else None
+                                ),
+                                "total_bytes": None,
+                                "speed_bps": None,
+                                "time_seconds": None,
+                                "duration_seconds": duration,
+                                "speed_factor": None,
+                                "message": (
+                                    "Stream capturado; convirtiendo el "
+                                    "contenedor temporal a MP4."
+                                ),
+                            }
+                        )
+
+                    completed = subprocess.run(
+                        remux,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        creationflags=getattr(
+                            subprocess,
+                            "CREATE_NO_WINDOW",
+                            0,
+                        ),
+                    )
+                    return_code = completed.returncode
+                    stderr = (completed.stderr or "").strip()
+
+                intermediate_ts.unlink(missing_ok=True)
+
         if return_code != 0:
             message = stderr or "FFmpeg no pudo guardar la fuente."
             raise RuntimeError(message)
