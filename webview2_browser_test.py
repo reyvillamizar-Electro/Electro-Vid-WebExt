@@ -317,7 +317,7 @@ def main() -> int:
     player_depth = 0
     initial_host = host_of(url)
     guard_state: dict[str, object] = {
-        "enabled": False,
+        "enabled": True,
         "allowed_hosts": {initial_host} if initial_host else set(),
         "handler_installed": False,
         "last_good_url": url,
@@ -370,7 +370,6 @@ def main() -> int:
                 if player_host:
                     allowed_hosts.add(player_host)
                 guard_state["last_good_url"] = player
-                guard_state["enabled"] = True
 
                 # The guard is active from startup. Add each discovered player
                 # host before navigating to it so only the legitimate player
@@ -412,7 +411,7 @@ def main() -> int:
     print("Abriendo prueba aislada con Microsoft Edge WebView2…")
     print("URL:", url)
     if "--player" in sys.argv[2:]:
-        print("Modo --player: esperará la inicialización completa de WebView2, atenderá popups sin salir de la página y seguirá la cadena del player.")
+        print("Modo --player: atenderá popups y bloqueará la redirección principal externa, manteniendo viva la página hasta llegar al player.")
     else:
         print("Se mostrarán los [IFRAME] detectados sin cambiar de página.")
     print("Cierra esta ventana para volver a PowerShell.")
