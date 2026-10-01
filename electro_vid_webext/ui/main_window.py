@@ -948,16 +948,24 @@ class MainWindow(QMainWindow):
                 else ""
             )
 
-            # Signed HLS URLs can rotate both query parameters and path
-            # components. Prefer page/CDN + quality identity over exact URL.
+            # Variant filenames are commonly stable while signed path
+            # components/tokens rotate. Using the final manifest filename lets
+            # a fresh WebView2 request replace an older expanded HLS row even
+            # when the newly observed request has no quality metadata yet.
+            filename = Path(parsed.path).name.lower()
+            if kind == "HLS" and (
+                filename.startswith("index-")
+                or filename in {"master.m3u8", "playlist.m3u8"}
+            ):
+                return f"{kind}|{host}|{filename}"
+
+            # Other signed stream URLs fall back to page/CDN + quality identity.
             if quality or resolution:
                 return (
                     f"{kind}|{host}|{referer_host}|"
                     f"{quality}|{resolution}"
                 )
 
-            # Master manifests without quality metadata are grouped by CDN and
-            # page context so a renewed master URL can replace an expired one.
             origin_class = source.origin.split("·", 1)[0].strip().lower()
             return f"{kind}|{host}|{referer_host}|{origin_class}"
 
