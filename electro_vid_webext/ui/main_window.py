@@ -179,6 +179,28 @@ class SpecializedWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class EmbeddedExtractorWorker(QObject):
+    finished = Signal(str, object, list)
+    skipped = Signal(str)
+    failed = Signal(str, str)
+
+    def __init__(self, url: str) -> None:
+        super().__init__()
+        self.url = url
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            match = detect_specific_extractor(self.url)
+            if match is None:
+                self.skipped.emit(self.url)
+                return
+            resolved_match, sources = extract_specialized_sources(self.url)
+            self.finished.emit(self.url, resolved_match, sources)
+        except Exception as exc:
+            self.failed.emit(self.url, str(exc))
+
+
 class DownloadWorker(QObject):
     progress = Signal(int)
     details = Signal(object)
@@ -249,6 +271,10 @@ class MainWindow(QMainWindow):
         self._manifest_worker: ManifestWorker | None = None
         self._specialized_thread: QThread | None = None
         self._specialized_worker: SpecializedWorker | None = None
+        self._embedded_thread: QThread | None = None
+        self._embedded_worker: EmbeddedExtractorWorker | None = None
+        self._embedded_queue: list[str] = []
+        self._embedded_checked: set[str] = set()
         self._download_thread: QThread | None = None
         self._download_worker: DownloadWorker | None = None
         self._download_dialog: QProgressDialog | None = None
@@ -530,6 +556,7 @@ class MainWindow(QMainWindow):
         self.browser = BrowserView()
         self.browser.media_found.connect(self._dynamic_media_found)
         self.browser.navigation_event.connect(self._browser_navigation_event)
+        self.browser.embedded_page_found.connect(self._embedded_page_found)
 
         self.navigation_table = QTableWidget(0, 4)
         self.navigation_table.setHorizontalHeaderLabels(
@@ -630,6 +657,82 @@ class MainWindow(QMainWindow):
                 "La página intentó abrir otra ventana; se registró sin permitir que tome el control."
             )
 
+    @Slot(str)
+    def _embedded_page_found(self, url: str) -> None:
+        mode = str(self.extractor_mode.currentData() or "auto")
+        if mode == "generic":
+            return
+        if not url.startswith(("http://", "https://")):
+            return
+        if url in self._embedded_checked or url in self._embedded_queue:
+            return
+        if len(self._embedded_checked) + len(self._embedded_queue) >= 12:
+            return
+
+        self._embedded_queue.append(url)
+        QTimer.singleShot(0, self._start_next_embedded_extractor)
+
+    def _start_next_embedded_extractor(self) -> None:
+        if self._embedded_thread and self._embedded_thread.isRunning():
+            return
+        if not self._embedded_queue:
+            return
+
+        url = self._embedded_queue.pop(0)
+        self._embedded_checked.add(url)
+
+        self._embedded_thread = QThread(self)
+        self._embedded_worker = EmbeddedExtractorWorker(url)
+        self._embedded_worker.moveToThread(self._embedded_thread)
+        self._embedded_thread.started.connect(self._embedded_worker.run)
+        self._embedded_worker.finished.connect(self._embedded_extractor_finished)
+        self._embedded_worker.skipped.connect(self._embedded_extractor_skipped)
+        self._embedded_worker.failed.connect(self._embedded_extractor_failed)
+        self._embedded_worker.finished.connect(self._embedded_thread.quit)
+        self._embedded_worker.skipped.connect(self._embedded_thread.quit)
+        self._embedded_worker.failed.connect(self._embedded_thread.quit)
+        self._embedded_thread.finished.connect(self._embedded_worker.deleteLater)
+        self._embedded_thread.finished.connect(self._embedded_thread.deleteLater)
+        self._embedded_thread.finished.connect(self._cleanup_embedded_thread)
+        self._embedded_thread.start()
+
+    @Slot(str, object, list)
+    def _embedded_extractor_finished(
+        self,
+        url: str,
+        match: object,
+        sources: list[VideoSource],
+    ) -> None:
+        extractor_name = getattr(match, "name", None) or getattr(match, "key", None) or "yt-dlp"
+        added = 0
+        for source in sources:
+            if self._add_source(source):
+                added += 1
+
+        if added:
+            self.status_label.setText(
+                f"Reproductor embebido reconocido por yt-dlp ({extractor_name}): "
+                f"{added} formato(s) añadido(s)."
+            )
+            self._scan_pending_metadata()
+
+    @Slot(str)
+    def _embedded_extractor_skipped(self, url: str) -> None:
+        pass
+
+    @Slot(str, str)
+    def _embedded_extractor_failed(self, url: str, message: str) -> None:
+        # Embedded players are opportunistic. A failure here must not interrupt
+        # the generic network/DOM detector.
+        pass
+
+    @Slot()
+    def _cleanup_embedded_thread(self) -> None:
+        self._embedded_thread = None
+        self._embedded_worker = None
+        if self._embedded_queue:
+            QTimer.singleShot(50, self._start_next_embedded_extractor)
+
     def _ensure_mpv(self) -> MPVController:
         if self._mpv is not None:
             return self._mpv
@@ -664,6 +767,8 @@ class MainWindow(QMainWindow):
         self._source_by_url = {}
         self._pending_metadata = {}
         self._pending_manifests = {}
+        self._embedded_queue = []
+        self._embedded_checked = set()
         self.analyze_button.setEnabled(False)
         mode = str(self.extractor_mode.currentData() or "auto")
         self.extractor_status.setText("Extractor: detectando…")
@@ -1698,6 +1803,7 @@ class MainWindow(QMainWindow):
             self._metadata_thread,
             self._manifest_thread,
             self._specialized_thread,
+            self._embedded_thread,
             self._download_thread,
         ]
         return [
