@@ -25,6 +25,77 @@ def log_request(request) -> None:
         print("[MEDIA]", url)
 
 
+def iframe_report(window: webview.Window) -> list[str]:
+    try:
+        raw = window.evaluate_js(
+            """
+            (() => {
+              const values = [];
+              document.querySelectorAll('iframe[src], frame[src]').forEach(frame => {
+                try {
+                  values.push(new URL(frame.src, document.baseURI).href);
+                } catch (_) {}
+              });
+              return JSON.stringify(Array.from(new Set(values)));
+            })();
+            """
+        )
+        if isinstance(raw, str):
+            values = json.loads(raw)
+        elif isinstance(raw, list):
+            values = raw
+        else:
+            values = []
+    except Exception as exc:
+        print(f"No se pudieron leer iframes: {exc}")
+        return []
+
+    result = [value for value in values if isinstance(value, str) and value.startswith(("http://", "https://"))]
+    for value in result:
+        print("[IFRAME]", value)
+    return result
+
+
+def choose_player_iframe(values: list[str]) -> str | None:
+    if not values:
+        return None
+
+    reject = (
+        "yandex.",
+        "google.",
+        "doubleclick.",
+        "googletagmanager.",
+        "facebook.",
+        "twitter.",
+        "tiktok.",
+    )
+    preferred = (
+        "/v/",
+        "/embed/",
+        "player",
+        "stream",
+        "video",
+    )
+
+    candidates = [
+        value
+        for value in values
+        if not any(token in value.lower() for token in reject)
+    ]
+    if not candidates:
+        return None
+
+    ranked = sorted(
+        candidates,
+        key=lambda value: (
+            any(token in value.lower() for token in preferred),
+            len(value),
+        ),
+        reverse=True,
+    )
+    return ranked[0]
+
+
 def codec_report(window: webview.Window) -> None:
     try:
         raw = window.evaluate_js(
@@ -79,9 +150,11 @@ def main() -> int:
         confirm_close=False,
     )
     first_codec_report = True
+    auto_player = "--player" in sys.argv[2:]
+    player_opened = False
 
     def on_loaded() -> None:
-        nonlocal first_codec_report
+        nonlocal first_codec_report, player_opened
         try:
             current = window.get_current_url()
         except Exception:
@@ -93,6 +166,14 @@ def main() -> int:
         if first_codec_report:
             first_codec_report = False
             codec_report(window)
+
+        frames = iframe_report(window)
+        if auto_player and not player_opened:
+            player = choose_player_iframe(frames)
+            if player:
+                player_opened = True
+                print("[PLAYER]", player)
+                window.load_url(player)
 
     window.events.loaded += on_loaded
     window.events.request_sent += log_request
@@ -106,6 +187,10 @@ def main() -> int:
 
     print("Abriendo prueba aislada con Microsoft Edge WebView2…")
     print("URL:", url)
+    if "--player" in sys.argv[2:]:
+        print("Modo --player: abrirá automáticamente el iframe que parece ser el reproductor.")
+    else:
+        print("Se mostrarán los [IFRAME] detectados sin cambiar de página.")
     print("Cierra esta ventana para volver a PowerShell.")
 
     webview.start(gui="edgechromium", debug=False)
