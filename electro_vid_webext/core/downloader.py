@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urljoin, urlparse
@@ -399,6 +400,49 @@ def _sanitize_hls_playlist(
     return path, removed
 
 
+def _serve_local_hls_playlist(
+    playlist_path: str,
+) -> tuple[ThreadingHTTPServer, threading.Thread, str]:
+    data = Path(playlist_path).read_bytes()
+
+    class _PlaylistHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path.split("?", 1)[0] != "/playlist.m3u8":
+                self.send_error(404)
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_HEAD(self) -> None:  # noqa: N802
+            if self.path.split("?", 1)[0] != "/playlist.m3u8":
+                self.send_error(404)
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
+        def log_message(self, format: str, *args) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _PlaylistHandler)
+    port = int(server.server_address[1])
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="electro-hls-local",
+        daemon=True,
+    )
+    thread.start()
+    return server, thread, f"http://127.0.0.1:{port}/playlist.m3u8"
+
+
 def temporary_download_path(destination: str) -> Path:
     target = Path(destination)
     suffix = target.suffix or ".mp4"
@@ -730,6 +774,8 @@ def _download_with_ffmpeg(
             and "not in allowed_segment_extensions" in stderr
         ):
             sanitized_path: str | None = None
+            local_server: ThreadingHTTPServer | None = None
+            local_thread: threading.Thread | None = None
             try:
                 sanitized_path, removed = _sanitize_hls_playlist(
                     source_url,
@@ -739,16 +785,23 @@ def _download_with_ffmpeg(
                     origin_header,
                 )
 
+                (
+                    local_server,
+                    local_thread,
+                    local_playlist_url,
+                ) = _serve_local_hls_playlist(sanitized_path)
+
                 sanitized = list(command)
                 input_index = sanitized.index("-i")
-                sanitized[input_index + 1] = sanitized_path
+                sanitized[input_index + 1] = local_playlist_url
 
-                # The local manifest contains absolute HTTPS segment URLs.
-                # Explicitly allow only the protocols required for local HLS +
-                # remote HTTP(S), rather than relaxing extension checks.
+                # Keep FFmpeg on an HTTP input so protocol-specific options
+                # such as user_agent, referer and headers remain valid. The
+                # manifest itself is served only on localhost and all segment
+                # URLs inside it are absolute remote URLs.
                 sanitized[input_index:input_index] = [
                     "-protocol_whitelist",
-                    "file,http,https,tcp,tls,crypto",
+                    "http,https,tcp,tls,crypto",
                 ]
 
                 temp_target.unlink(missing_ok=True)
@@ -772,6 +825,17 @@ def _download_with_ffmpeg(
 
                 return_code, stderr = _run_ffmpeg(sanitized)
             finally:
+                if local_server is not None:
+                    try:
+                        local_server.shutdown()
+                    except Exception:
+                        pass
+                    try:
+                        local_server.server_close()
+                    except Exception:
+                        pass
+                if local_thread is not None:
+                    local_thread.join(timeout=1.0)
                 if sanitized_path:
                     Path(sanitized_path).unlink(missing_ok=True)
 
