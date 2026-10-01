@@ -138,7 +138,20 @@ def extract_specialized_sources(url: str) -> tuple[ExtractorMatch, list[VideoSou
         if not has_audio and best_audio is not None:
             audio_url = str(best_audio.get("url") or "") or None
 
-        selector = format_id if has_audio else f"{format_id}+bestaudio/best"
+        if has_audio:
+            selector = format_id
+        elif ext.lower() == "mp4":
+            selector = (
+                f"{format_id}+bestaudio[ext=m4a]/"
+                f"{format_id}+bestaudio/{format_id}"
+            )
+        elif ext.lower() == "webm":
+            selector = (
+                f"{format_id}+bestaudio[ext=webm]/"
+                f"{format_id}+bestaudio/{format_id}"
+            )
+        else:
+            selector = f"{format_id}+bestaudio/{format_id}"
 
         sources.append(
             VideoSource(
