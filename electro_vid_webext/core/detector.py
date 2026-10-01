@@ -34,6 +34,12 @@ class VideoSource:
     quality_hint: str = "—"
     resolution_hint: str = "—"
     protection: str = "—"
+    backend: str = "generic"
+    extractor_key: str | None = None
+    format_id: str | None = None
+    webpage_url: str | None = None
+    title: str | None = None
+    audio_url: str | None = None
 
 
 class _MediaHTMLParser(HTMLParser):
