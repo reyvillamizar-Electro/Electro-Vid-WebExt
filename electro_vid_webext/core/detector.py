@@ -13,10 +13,11 @@ MEDIA_EXTENSIONS = {
     ".mpd": "DASH",
     ".mov": "MOV",
     ".m4v": "M4V",
+    ".mkv": "MKV",
 }
 
 MEDIA_URL_RE = re.compile(
-    r"""(?P<url>(?:https?:)?//[^\s\"'<>]+?\.(?:mp4|webm|m3u8|mpd|mov|m4v)(?:\?[^\s\"'<>]*)?)""",
+    r"""(?P<url>(?:https?:)?//[^\s\"'<>]+?\.(?:mp4|webm|m3u8|mpd|mov|m4v|mkv)(?:\?[^\s\"'<>]*)?)""",
     re.IGNORECASE,
 )
 
