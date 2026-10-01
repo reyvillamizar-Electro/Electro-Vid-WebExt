@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -25,6 +26,7 @@ class BrowserView(QWidget):
         self._stdout_buffer = ""
         self._initial_url = ""
         self._current_url = ""
+        self._debug_port = 0
         self._user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -106,6 +108,21 @@ class BrowserView(QWidget):
 
         env = QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONUNBUFFERED", "1")
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            self._debug_port = int(probe.getsockname()[1])
+
+        existing_args = env.value("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
+        debug_args = (
+            f"--remote-debugging-address=127.0.0.1 "
+            f"--remote-debugging-port={self._debug_port} "
+            f"--remote-allow-origins=http://127.0.0.1:{self._debug_port}"
+        )
+        env.insert(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            f"{existing_args} {debug_args}".strip(),
+        )
         process.setProcessEnvironment(env)
 
         process.setProgram(sys.executable)
@@ -265,6 +282,9 @@ class BrowserView(QWidget):
             return
         data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
         process.write(data)
+
+    def debug_port(self) -> int:
+        return self._debug_port
 
     def prepare_recording_playback(self) -> None:
         self._send({"action": "prepare_recording"})
