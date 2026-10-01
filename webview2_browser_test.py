@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from urllib.parse import urlparse
 
 import webview
 
@@ -116,15 +117,44 @@ def main() -> int:
         text_select=True,
         confirm_close=False,
     )
-    def on_loaded(current_window: webview.Window) -> None:
-        install_popup_blocker(current_window)
-        codec_report(current_window)
+    original_url = url
+    original_host = (urlparse(original_url).hostname or "").lower()
 
+    def host_allowed(candidate_url: str | None) -> bool:
+        if not candidate_url:
+            return True
+        parsed = urlparse(candidate_url)
+        if parsed.scheme not in {"http", "https"}:
+            return True
+        host = (parsed.hostname or "").lower()
+        return (
+            host == original_host
+            or host.endswith("." + original_host)
+        )
+
+    def on_before_load() -> None:
+        current = window.get_current_url()
+        if current and not host_allowed(current):
+            print("[NAV BLOQUEADA]", current)
+            window.load_url(original_url)
+            return
+        install_popup_blocker(window)
+
+    def on_loaded() -> None:
+        current = window.get_current_url()
+        if current and not host_allowed(current):
+            print("[NAV BLOQUEADA]", current)
+            window.load_url(original_url)
+            return
+        install_popup_blocker(window)
+        codec_report(window)
+
+    window.events.before_load += on_before_load
     window.events.loaded += on_loaded
     window.events.request_sent += log_request
 
-    # pywebview normally sends target=_blank links to the external browser.
-    # Keep them inside the WebView layer so our blocker can suppress them.
+    # Keep popups/new-window links inside the WebView layer so our injected
+    # blocker and top-level navigation guard can suppress them.
     webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = False
     webview.settings["ALLOW_DOWNLOADS"] = False
     webview.settings["IGNORE_SSL_ERRORS"] = False
