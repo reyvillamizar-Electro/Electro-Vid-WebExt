@@ -320,6 +320,17 @@ class BrowserView(QWebEngineView):
         self.page().scripts().insert(script)
 
     def _install_media_compatibility_shim(self) -> None:
+        previous = getattr(self, "_media_compatibility_script", None)
+        if previous is not None:
+            try:
+                self.page().scripts().remove(previous)
+            except Exception:
+                pass
+
+        enabled_literal = (
+            "true" if self._media_compatibility_enabled else "false"
+        )
+
         script = QWebEngineScript()
         script.setName("ElectroVidWebExt.MediaCompatibility")
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
@@ -329,12 +340,11 @@ class BrowserView(QWebEngineView):
             """
             (() => {
               if (window.__ELECTRO_MEDIA_COMPAT_INSTALLED__) {
-                window.__ELECTRO_MEDIA_COMPAT__ = true;
                 return;
               }
 
               window.__ELECTRO_MEDIA_COMPAT_INSTALLED__ = true;
-              window.__ELECTRO_MEDIA_COMPAT__ = true;
+              window.__ELECTRO_MEDIA_COMPAT__ = __DEFAULT_ENABLED__;
 
               const targetType = (value) => {
                 const type = String(value || '').toLowerCase();
@@ -436,10 +446,17 @@ class BrowserView(QWebEngineView):
             })();
             """
         )
+        source = script.sourceCode().replace(
+            "__DEFAULT_ENABLED__",
+            enabled_literal,
+        )
+        script.setSourceCode(source)
         self.page().scripts().insert(script)
+        self._media_compatibility_script = script
 
     def set_media_compatibility(self, enabled: bool) -> None:
         self._media_compatibility_enabled = bool(enabled)
+        self._install_media_compatibility_shim()
         value = "true" if enabled else "false"
         script = (
             "window.__ELECTRO_MEDIA_COMPAT__ = "
