@@ -8,7 +8,7 @@ Aplicación de escritorio para detectar, inspeccionar, previsualizar y descargar
 - inicio maximizado y diseño adaptable al área útil de Windows;
 - detección de elementos `<video>`, `<source>`, OpenGraph y enlaces directos;
 - MP4, WebM, HLS (`.m3u8`), DASH (`.mpd`), MOV y M4V;
-- tabla con tipo, duración, calidad, resolución exacta, codec, tamaño, origen y URL;
+- tabla con tipo, duración, calidad, resolución exacta, codec, tamaño, protección, origen y URL;
 - filtro global o por columna;
 - ordenamiento al hacer clic en cualquier encabezado;
 - columnas redimensionables manualmente y desplazamiento horizontal;
@@ -91,6 +91,16 @@ uv run main.py
 La aplicación incorpora QtWebEngine en la pestaña **Navegador**. Al cargar o reproducir contenido dentro de esa pestaña, inspecciona solicitudes de red y el DOM para incorporar nuevas fuentes MP4, WebM, HLS y DASH a la tabla de resultados sin duplicados.
 
 Esto permite encontrar fuentes y variantes que no están presentes en el HTML inicial. Los enlaces `blob:` no se descargan directamente; se intenta detectar la fuente de red subyacente.
+
+### Sesión del navegador
+
+Cuando QtWebEngine captura una fuente, Electro Vid-WebExt conserva el contexto útil de esa petición (Referer, User-Agent, Origin y cookies aplicables) y lo reutiliza con mpv, FFprobe y FFmpeg cuando es posible. Esto mejora la compatibilidad con servidores que reproducen correctamente en el navegador pero rechazan peticiones externas sin sesión.
+
+### Variantes HLS y protección
+
+Los manifiestos HLS maestros se inspeccionan y sus variantes se agregan como filas separadas con pistas de calidad/resolución. Así puedes escoger una variante concreta en vez de depender siempre de la primera calidad disponible.
+
+La columna **Protección** marca señales reconocibles de Widevine, PlayReady o FairPlay. En esos casos la aplicación no intenta reproducir ni descargar saltándose DRM. Un HLS cifrado convencional puede mostrarse como **Cifrado HLS** sin asumir automáticamente que sea DRM.
 
 ## Uso responsable
 
