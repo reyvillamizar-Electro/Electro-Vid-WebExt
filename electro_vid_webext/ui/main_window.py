@@ -990,7 +990,7 @@ class MainWindow(QMainWindow):
             if action == "preview":
                 self._preview_source_now(source)
             else:
-                self._run_with_fresh_source("download", source)
+                self._start_download(source)
             return
 
         self._pending_fresh_action = (action, source)
@@ -1599,7 +1599,7 @@ class MainWindow(QMainWindow):
         if source is None:
             QMessageBox.information(self, "Selecciona un video", "Selecciona una fila primero.")
             return
-        self._start_download(source)
+        self._run_with_fresh_source("download", source)
 
     @Slot()
     def download_preview(self) -> None:
