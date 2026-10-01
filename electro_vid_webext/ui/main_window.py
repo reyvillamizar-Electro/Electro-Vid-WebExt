@@ -258,8 +258,9 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_browser_tab(), "Navegador")
 
         self.note_label = QLabel(
-            "FFprobe obtiene duración, resolución y codec. mpv usa aceleración segura y "
-            "fallback por software. Descarga solo fuentes accesibles normalmente por el navegador."
+            "FFprobe obtiene duración, resolución y codec. mpv/FFmpeg reutilizan la sesión "
+            "del navegador cuando es posible. Los manifiestos HLS se expanden por calidad y "
+            "el contenido con DRM detectado se marca como no compatible."
         )
         self.note_label.setWordWrap(True)
         self.note_label.setStyleSheet("color: #777;")
@@ -529,6 +530,11 @@ class MainWindow(QMainWindow):
             if existing is not None:
                 enriched = replace(
                     existing,
+                    kind=(
+                        source.kind
+                        if existing.kind == "Media" and source.kind != "Media"
+                        else existing.kind
+                    ),
                     referer=source.referer or existing.referer,
                     user_agent=source.user_agent or existing.user_agent,
                     cookie_header=source.cookie_header or existing.cookie_header,
@@ -554,6 +560,33 @@ class MainWindow(QMainWindow):
                     self._pending_metadata[source.url] = enriched
                     if enriched.kind.upper() in {"HLS", "DASH"}:
                         self._pending_manifests[source.url] = enriched
+
+                    row = self._row_for_url(source.url)
+                    if row is not None:
+                        self.table.setItem(row, self.KIND_COLUMN, SortItem(enriched.kind))
+                        if enriched.quality_hint != "—":
+                            self.table.setItem(
+                                row,
+                                self.QUALITY_COLUMN,
+                                SortItem(
+                                    enriched.quality_hint,
+                                    self._quality_sort(enriched.quality_hint),
+                                ),
+                            )
+                        if enriched.resolution_hint != "—":
+                            self.table.setItem(
+                                row,
+                                self.RESOLUTION_COLUMN,
+                                SortItem(
+                                    enriched.resolution_hint,
+                                    self._resolution_sort(enriched.resolution_hint),
+                                ),
+                            )
+                        self.table.setItem(
+                            row,
+                            self.PROTECTION_COLUMN,
+                            SortItem(enriched.protection),
+                        )
             return False
 
         self._known_urls.add(source.url)
