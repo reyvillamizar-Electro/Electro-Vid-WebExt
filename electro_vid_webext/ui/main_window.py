@@ -6,8 +6,8 @@ from dataclasses import replace
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from PySide6.QtCore import QObject, QStandardPaths, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QGuiApplication
+from PySide6.QtCore import QObject, QStandardPaths, QThread, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -198,6 +198,7 @@ class MainWindow(QMainWindow):
         self._download_thread: QThread | None = None
         self._download_worker: DownloadWorker | None = None
         self._download_dialog: QProgressDialog | None = None
+        self._last_download_path: str | None = None
 
         self._sources: list[VideoSource] = []
         self._known_urls: set[str] = set()
@@ -233,15 +234,16 @@ class MainWindow(QMainWindow):
         header_layout.setSpacing(6)
 
         title = QLabel("Electro Vid-WebExt")
-        title.setStyleSheet("font-size: 25px; font-weight: 700;")
+        title.setObjectName("appTitle")
         subtitle = QLabel("Detecta, inspecciona, previsualiza y descarga fuentes de video web.")
-        subtitle.setStyleSheet("color: #666;")
+        subtitle.setObjectName("subtitleLabel")
 
         url_row = QHBoxLayout()
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("https://sitio.com/pagina-con-video")
         self.url_input.returnPressed.connect(self.start_analysis)
         self.analyze_button = QPushButton("Analizar")
+        self.analyze_button.setProperty("role", "primary")
         self.analyze_button.clicked.connect(self.start_analysis)
         url_row.addWidget(self.url_input, 1)
         url_row.addWidget(self.analyze_button)
@@ -251,6 +253,7 @@ class MainWindow(QMainWindow):
         header_layout.addLayout(url_row)
 
         self.status_label = QLabel("Listo. Pega una URL para comenzar.")
+        self.status_label.setObjectName("statusLabel")
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_results_tab(), "Resultados")
@@ -263,7 +266,7 @@ class MainWindow(QMainWindow):
             "el contenido con DRM detectado se marca como no compatible."
         )
         self.note_label.setWordWrap(True)
-        self.note_label.setStyleSheet("color: #777;")
+        self.note_label.setObjectName("secondaryLabel")
 
         layout.addWidget(self.header_widget)
         layout.addWidget(self.status_label)
@@ -299,6 +302,8 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
         self.table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -312,16 +317,22 @@ class MainWindow(QMainWindow):
         self.table.doubleClicked.connect(self.preview_selected)
 
         actions = QHBoxLayout()
-        self.preview_button = QPushButton("Previsualizar")
+        self.preview_button = QPushButton("▶ Previsualizar")
+        self.preview_button.setProperty("role", "primary")
         self.download_button = QPushButton("⬇ Descargar")
-        self.open_button = QPushButton("Abrir fuente")
+        self.download_button.setProperty("role", "success")
+        self.open_folder_button = QPushButton("📁 Abrir carpeta")
+        self.open_folder_button.setEnabled(False)
+        self.open_button = QPushButton("↗ Abrir fuente")
         self.copy_button = QPushButton("Copiar URL")
         self.preview_button.clicked.connect(self.preview_selected)
         self.download_button.clicked.connect(self.download_selected)
+        self.open_folder_button.clicked.connect(self.open_download_folder)
         self.open_button.clicked.connect(self.open_selected)
         self.copy_button.clicked.connect(self.copy_selected)
         actions.addWidget(self.preview_button)
         actions.addWidget(self.download_button)
+        actions.addWidget(self.open_folder_button)
         actions.addWidget(self.open_button)
         actions.addWidget(self.copy_button)
         actions.addStretch(1)
@@ -366,6 +377,9 @@ class MainWindow(QMainWindow):
         self.loop_b_button = QPushButton("B")
         self.clear_ab_button = QPushButton("A–B ✕")
         self.download_preview_button = QPushButton("⬇ Descargar")
+        self.download_preview_button.setProperty("role", "success")
+        self.open_folder_preview_button = QPushButton("📁 Carpeta")
+        self.open_folder_preview_button.setEnabled(False)
         self.fullscreen_button = QPushButton("⛶ Pantalla completa")
 
         self.play_button.clicked.connect(self.toggle_playback)
@@ -375,6 +389,7 @@ class MainWindow(QMainWindow):
         self.loop_b_button.clicked.connect(self.mark_loop_b)
         self.clear_ab_button.clicked.connect(self.clear_ab_loop)
         self.download_preview_button.clicked.connect(self.download_preview)
+        self.open_folder_preview_button.clicked.connect(self.open_download_folder)
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen_preview)
 
         controls.addWidget(self.play_button)
@@ -384,6 +399,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.loop_b_button)
         controls.addWidget(self.clear_ab_button)
         controls.addWidget(self.download_preview_button)
+        controls.addWidget(self.open_folder_preview_button)
         controls.addWidget(self.fullscreen_button)
         controls.addStretch(1)
 
@@ -411,7 +427,7 @@ class MainWindow(QMainWindow):
         self.mpv_status = QLabel(
             f"Motor: mpv · {path}" if path else "Motor: mpv no encontrado"
         )
-        self.mpv_status.setStyleSheet("color: #777;")
+        self.mpv_status.setObjectName("secondaryLabel")
 
         layout.addWidget(self.preview_title)
         layout.addWidget(self.video_surface, 1)
@@ -1156,8 +1172,21 @@ class MainWindow(QMainWindow):
             self._download_dialog.setRange(0, 100)
             self._download_dialog.setValue(100)
             self._download_dialog.close()
+        self._last_download_path = destination
+        self.open_folder_button.setEnabled(True)
+        self.open_folder_preview_button.setEnabled(True)
         self.status_label.setText(f"Descarga completada: {destination}")
-        QMessageBox.information(self, "Descarga completada", f"Guardado en:\n{destination}")
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Descarga completada")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText("El video se guardó correctamente.")
+        box.setInformativeText(destination)
+        open_button = box.addButton("Abrir carpeta", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is open_button:
+            self.open_download_folder()
 
     @Slot(str)
     def _download_failed(self, message: str) -> None:
@@ -1172,7 +1201,7 @@ class MainWindow(QMainWindow):
         self._download_worker = None
         self._download_dialog = None
 
-    @Slot()
+    @Slot()\n    def open_download_folder(self) -> None:\n        if not self._last_download_path:\n            QMessageBox.information(\n                self,\n                "Sin descarga",\n                "Todavía no hay un archivo descargado en esta sesión.",\n            )\n            return\n\n        folder = Path(self._last_download_path).resolve().parent\n        if not folder.exists():\n            QMessageBox.warning(\n                self,\n                "Carpeta no disponible",\n                f"No se encontró la carpeta:\\n{folder}",\n            )\n            return\n\n        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))\n\n    @Slot()
     def open_selected(self) -> None:
         url = self._selected_url()
         if url:
