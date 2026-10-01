@@ -5,6 +5,8 @@ import os
 import sys
 import threading
 import time
+from urllib.parse import urlparse
+
 import webview
 
 
@@ -27,85 +29,72 @@ def log_request(request) -> None:
         print("[MEDIA]", url)
 
 
-def install_ghost_popup(window: webview.Window) -> None:
+def install_native_navigation_guard(
+    window: webview.Window,
+    state: dict[str, object],
+) -> None:
     try:
-        window.run_js(
-            """
-            (() => {
-              if (window.__ELECTRO_GHOST_POPUP__) return;
-              window.__ELECTRO_GHOST_POPUP__ = true;
-
-              const frame = document.createElement('iframe');
-              frame.src = 'about:blank';
-              frame.setAttribute('aria-hidden', 'true');
-              frame.tabIndex = -1;
-              frame.style.cssText = [
-                'position:fixed',
-                'left:-10000px',
-                'top:-10000px',
-                'width:1px',
-                'height:1px',
-                'opacity:0',
-                'pointer-events:none',
-                'border:0'
-              ].join(';');
-              document.documentElement.appendChild(frame);
-
-              const ghost = frame.contentWindow;
-              if (!ghost) return;
-
-              try {
-                ghost.focus = () => {};
-                ghost.blur = () => {};
-              } catch (_) {}
-
-              window.open = function(url, target, features) {
-                try {
-                  console.warn(
-                    '[Electro Test] popup fantasma:',
-                    String(url || '')
-                  );
-                } catch (_) {}
-
-                // Keep a real WindowProxy alive but do not navigate it to the
-                // advertising URL. This avoids a visible popup while giving
-                // scripts a genuine window-like return value.
-                try {
-                  if (ghost.closed) {
-                    return null;
-                  }
-                } catch (_) {}
-
-                return ghost;
-              };
-
-              document.addEventListener(
-                'click',
-                (event) => {
-                  const element = event.target instanceof Element
-                    ? event.target.closest('a[target="_blank"]')
-                    : null;
-                  if (!element) return;
-
-                  // Do not let target=_blank links escape to the system
-                  // browser. The site's window.open path receives the ghost.
-                  event.preventDefault();
-                  event.stopPropagation();
-                  try {
-                    console.warn(
-                      '[Electro Test] target=_blank contenido:',
-                      element.href || ''
-                    );
-                  } catch (_) {}
-                },
-                true
-              );
-            })();
-            """
-        )
-        print("[GHOST] bloqueo de popups activo en el reproductor")
+        native_webview = window.native.webview
     except Exception as exc:
-        print(f"[GHOST] no se pudo instalar: {exc}")
+        print(f"[GUARD] WebView2 nativo no disponible: {exc}")
+        return
+
+    if state.get("handler_installed"):
+        return
+
+    def on_navigation_starting(sender, args) -> None:
+        if not state.get("enabled"):
+            return
+
+        try:
+            uri = str(args.Uri or "")
+        except Exception:
+            uri = ""
+
+        if not uri:
+            return
+
+        parsed = urlparse(uri)
+        if parsed.scheme not in {"http", "https"}:
+            return
+
+        host = (parsed.hostname or "").lower()
+        allowed_hosts = state.get("allowed_hosts")
+        if not isinstance(allowed_hosts, set):
+            allowed_hosts = set()
+
+        allowed = any(
+            host == allowed_host or host.endswith("." + allowed_host)
+            for allowed_host in allowed_hosts
+            if allowed_host
+        )
+        if allowed:
+            return
+
+        try:
+            args.Cancel = True
+        except Exception:
+            try:
+                args.set_Cancel(True)
+            except Exception as exc:
+                print(f"[GUARD] no se pudo cancelar {uri}: {exc}")
+                return
+
+        print("[NAV-CANCEL]", uri)
+
+    try:
+        native_webview.NavigationStarting += on_navigation_starting
+        state["handler_installed"] = True
+        state["handler"] = on_navigation_starting
+        print("[GUARD] interceptor nativo NavigationStarting instalado")
+    except Exception as exc:
+        print(f"[GUARD] no se pudo instalar: {exc}")
+
+
+def host_of(value: str | None) -> str:
+    if not value:
+        return ""
+    return (urlparse(value).hostname or "").lower()
 
 
 def media_snapshot(window: webview.Window) -> list[str]:
@@ -309,6 +298,16 @@ def main() -> int:
     visited_players: set[str] = set()
     player_depth = 0
     monitor_started = False
+    guard_state: dict[str, object] = {
+        "enabled": False,
+        "allowed_hosts": set(),
+        "handler_installed": False,
+    }
+
+    def on_before_show() -> None:
+        install_native_navigation_guard(window, guard_state)
+
+    window.events.before_show += on_before_show
 
     def on_loaded() -> None:
         nonlocal first_codec_report, player_depth, monitor_started
@@ -332,21 +331,47 @@ def main() -> int:
         if auto_player and player_depth < 5:
             player = choose_player_iframe(frames)
             if player and player not in visited_players:
+                current_host = host_of(current)
+                player_host = host_of(player)
+
+                allowed_hosts = guard_state.get("allowed_hosts")
+                if not isinstance(allowed_hosts, set):
+                    allowed_hosts = set()
+                    guard_state["allowed_hosts"] = allowed_hosts
+
+                if current_host:
+                    allowed_hosts.add(current_host)
+                if player_host:
+                    allowed_hosts.add(player_host)
+
+                # From the first embedded player onward, keep top-level
+                # navigation inside the known player chain. Subresources such
+                # as HLS segments are unaffected by NavigationStarting.
+                if player_depth >= 1:
+                    guard_state["enabled"] = True
+                    print(
+                        "[GUARD] navegación externa bloqueada; hosts permitidos:",
+                        ", ".join(sorted(allowed_hosts)),
+                    )
+
                 visited_players.add(player)
                 player_depth += 1
                 print(f"[PLAYER {player_depth}]", player)
                 window.load_url(player)
                 return
 
-        if auto_player and player_depth >= 2:
-            install_ghost_popup(window)
+        if auto_player and player_depth >= 1:
+            current_host = host_of(current)
+            allowed_hosts = guard_state.get("allowed_hosts")
+            if isinstance(allowed_hosts, set) and current_host:
+                allowed_hosts.add(current_host)
+            guard_state["enabled"] = True
 
     window.events.loaded += on_loaded
     window.events.request_sent += log_request
 
-    # For this diagnostic, do not alter the site's popup/player flow.
-    # New-window links may open in the system browser so the WebView2 player
-    # page remains intact while we verify actual media playback.
+    # Keep new-window requests out of the system browser. Top-level redirects
+    # are separately controlled by the native NavigationStarting guard.
     webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = False
     webview.settings["ALLOW_DOWNLOADS"] = False
     webview.settings["IGNORE_SSL_ERRORS"] = False
@@ -354,7 +379,7 @@ def main() -> int:
     print("Abriendo prueba aislada con Microsoft Edge WebView2…")
     print("URL:", url)
     if "--player" in sys.argv[2:]:
-        print("Modo --player: seguirá la cadena de iframes y activará popup fantasma en el player.")
+        print("Modo --player: seguirá los iframes y bloqueará redirecciones externas a nivel nativo.")
     else:
         print("Se mostrarán los [IFRAME] detectados sin cambiar de página.")
     print("Cierra esta ventana para volver a PowerShell.")
