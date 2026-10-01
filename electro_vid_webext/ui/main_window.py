@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
@@ -40,6 +41,12 @@ from electro_vid_webext.core.downloader import (
 from electro_vid_webext.core.manifest import inspect_manifest
 from electro_vid_webext.core.metadata import MediaMetadata, ffprobe_available, read_media_metadata
 from electro_vid_webext.core.mpv_player import MPVController, MPVError
+from electro_vid_webext.core.specialized import (
+    SpecializedDownloadCancelled,
+    detect_specific_extractor,
+    download_specialized,
+    extract_specialized_sources,
+)
 from electro_vid_webext.ui.browser_view import BrowserView
 
 
@@ -149,6 +156,28 @@ class ManifestWorker(QObject):
         self.finished.emit()
 
 
+class SpecializedWorker(QObject):
+    finished = Signal(object, list)
+    unsupported = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, url: str) -> None:
+        super().__init__()
+        self.url = url
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            match = detect_specific_extractor(self.url)
+            if match is None:
+                self.unsupported.emit("No hay extractor específico; se usará el método genérico.")
+                return
+            resolved_match, sources = extract_specialized_sources(self.url)
+            self.finished.emit(resolved_match, sources)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class DownloadWorker(QObject):
     progress = Signal(int)
     details = Signal(object)
@@ -163,19 +192,30 @@ class DownloadWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            download_media(
-                self.source.url,
-                self.destination,
-                self.source.kind,
-                progress=self.progress.emit,
-                progress_details=self.details.emit,
-                referer=self.source.referer,
-                user_agent=self.source.user_agent,
-                cookie_header=self.source.cookie_header,
-                origin_header=self.source.origin_header,
-                cancelled=lambda: QThread.currentThread().isInterruptionRequested(),
-            )
-        except DownloadCancelled:
+            cancelled = lambda: QThread.currentThread().isInterruptionRequested()
+
+            if self.source.backend == "yt-dlp":
+                download_specialized(
+                    self.source,
+                    self.destination,
+                    progress=self.progress.emit,
+                    progress_details=self.details.emit,
+                    cancelled=cancelled,
+                )
+            else:
+                download_media(
+                    self.source.url,
+                    self.destination,
+                    self.source.kind,
+                    progress=self.progress.emit,
+                    progress_details=self.details.emit,
+                    referer=self.source.referer,
+                    user_agent=self.source.user_agent,
+                    cookie_header=self.source.cookie_header,
+                    origin_header=self.source.origin_header,
+                    cancelled=cancelled,
+                )
+        except (DownloadCancelled, SpecializedDownloadCancelled):
             self.failed.emit("Descarga cancelada.")
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -206,6 +246,8 @@ class MainWindow(QMainWindow):
         self._metadata_worker: MetadataWorker | None = None
         self._manifest_thread: QThread | None = None
         self._manifest_worker: ManifestWorker | None = None
+        self._specialized_thread: QThread | None = None
+        self._specialized_worker: SpecializedWorker | None = None
         self._download_thread: QThread | None = None
         self._download_worker: DownloadWorker | None = None
         self._download_dialog: QProgressDialog | None = None
@@ -262,12 +304,26 @@ class MainWindow(QMainWindow):
         self.analyze_button = QPushButton("Analizar")
         self.analyze_button.setProperty("role", "primary")
         self.analyze_button.clicked.connect(self.start_analysis)
+        self.extractor_mode = QComboBox()
+        self.extractor_mode.addItem("Automático", "auto")
+        self.extractor_mode.addItem("Genérico · navegador/red", "generic")
+        self.extractor_mode.addItem("yt-dlp · especializado", "yt-dlp")
+        self.extractor_mode.setToolTip(
+            "Automático usa yt-dlp cuando existe un extractor específico y conserva "
+            "el navegador/red como respaldo."
+        )
+
+        self.extractor_status = QLabel("Extractor: automático")
+        self.extractor_status.setObjectName("secondaryLabel")
+
         url_row.addWidget(self.url_input, 1)
+        url_row.addWidget(self.extractor_mode)
         url_row.addWidget(self.analyze_button)
 
         header_layout.addWidget(title)
         header_layout.addWidget(subtitle)
         header_layout.addLayout(url_row)
+        header_layout.addWidget(self.extractor_status)
 
         self.status_label = QLabel("Listo. Pega una URL para comenzar.")
         self.status_label.setObjectName("statusLabel")
@@ -608,9 +664,20 @@ class MainWindow(QMainWindow):
         self._pending_metadata = {}
         self._pending_manifests = {}
         self.analyze_button.setEnabled(False)
+        mode = str(self.extractor_mode.currentData() or "auto")
+        self.extractor_status.setText("Extractor: detectando…")
         self.status_label.setText("Analizando página y cargando navegador…")
         self.browser.load_page(url)
 
+        if mode in {"auto", "generic"}:
+            self._start_generic_analysis(url)
+        if mode in {"auto", "yt-dlp"}:
+            self._start_specialized_analysis(url)
+
+        if mode == "generic":
+            self.extractor_status.setText("Extractor: genérico · navegador/red")
+
+    def _start_generic_analysis(self, url: str) -> None:
         self._analysis_thread = QThread(self)
         self._analysis_worker = AnalysisWorker(url)
         self._analysis_worker.moveToThread(self._analysis_thread)
@@ -623,6 +690,76 @@ class MainWindow(QMainWindow):
         self._analysis_thread.finished.connect(self._analysis_thread.deleteLater)
         self._analysis_thread.finished.connect(self._cleanup_analysis_thread)
         self._analysis_thread.start()
+
+    def _start_specialized_analysis(self, url: str) -> None:
+        if self._specialized_thread and self._specialized_thread.isRunning():
+            return
+
+        self._specialized_thread = QThread(self)
+        self._specialized_worker = SpecializedWorker(url)
+        self._specialized_worker.moveToThread(self._specialized_thread)
+        self._specialized_thread.started.connect(self._specialized_worker.run)
+        self._specialized_worker.finished.connect(self._specialized_finished)
+        self._specialized_worker.unsupported.connect(self._specialized_unsupported)
+        self._specialized_worker.failed.connect(self._specialized_failed)
+        self._specialized_worker.finished.connect(self._specialized_thread.quit)
+        self._specialized_worker.unsupported.connect(self._specialized_thread.quit)
+        self._specialized_worker.failed.connect(self._specialized_thread.quit)
+        self._specialized_thread.finished.connect(self._specialized_worker.deleteLater)
+        self._specialized_thread.finished.connect(self._specialized_thread.deleteLater)
+        self._specialized_thread.finished.connect(self._cleanup_specialized_thread)
+        self._specialized_thread.start()
+
+    @Slot(object, list)
+    def _specialized_finished(self, match: object, sources: list[VideoSource]) -> None:
+        extractor_name = getattr(match, "name", None) or getattr(match, "key", None) or "yt-dlp"
+        self.extractor_status.setText(f"Extractor: yt-dlp · {extractor_name}")
+
+        added = 0
+        for source in sources:
+            if self._add_source(source):
+                added += 1
+
+        if added:
+            self.status_label.setText(
+                f"yt-dlp encontró {added} calidad(es). Leyendo metadatos…"
+            )
+            if self.table.rowCount() > 0 and self.table.currentRow() < 0:
+                self.table.selectRow(0)
+            self._scan_pending_metadata()
+
+        self.analyze_button.setEnabled(True)
+
+    @Slot(str)
+    def _specialized_unsupported(self, message: str) -> None:
+        mode = str(self.extractor_mode.currentData() or "auto")
+        if mode == "yt-dlp":
+            self.extractor_status.setText("Extractor: yt-dlp · no compatible con esta URL")
+            self.status_label.setText(message)
+        else:
+            self.extractor_status.setText("Extractor: genérico · navegador/red")
+        self.analyze_button.setEnabled(True)
+
+    @Slot(str)
+    def _specialized_failed(self, message: str) -> None:
+        mode = str(self.extractor_mode.currentData() or "auto")
+        if mode == "yt-dlp":
+            self.status_label.setText(f"yt-dlp: {message}")
+        elif self._sources:
+            self.status_label.setText(
+                f"yt-dlp no pudo completar la extracción; se conservan {len(self._sources)} "
+                "fuente(s) del método genérico."
+            )
+        else:
+            self.status_label.setText(
+                "yt-dlp no pudo completar la extracción; el navegador seguirá buscando."
+            )
+        self.analyze_button.setEnabled(True)
+
+    @Slot()
+    def _cleanup_specialized_thread(self) -> None:
+        self._specialized_thread = None
+        self._specialized_worker = None
 
     @Slot(list)
     def _analysis_finished(self, sources: list[VideoSource]) -> None:
@@ -677,6 +814,17 @@ class MainWindow(QMainWindow):
                         if source.protection != "—"
                         else existing.protection
                     ),
+                    backend=(
+                        source.backend
+                        if source.backend != "generic"
+                        else existing.backend
+                    ),
+                    extractor_key=source.extractor_key or existing.extractor_key,
+                    format_id=source.format_id or existing.format_id,
+                    format_selector=source.format_selector or existing.format_selector,
+                    webpage_url=source.webpage_url or existing.webpage_url,
+                    title=source.title or existing.title,
+                    audio_url=source.audio_url or existing.audio_url,
                 )
                 if enriched != existing:
                     self._source_by_url[source.url] = enriched
@@ -1016,6 +1164,7 @@ class MainWindow(QMainWindow):
                 user_agent=source.user_agent,
                 cookie_header=source.cookie_header,
                 origin_header=source.origin_header,
+                audio_url=source.audio_url,
             )
             player.set_file_loop(self.loop_button.isChecked())
             player.set_ab_loop(None, None)
@@ -1234,9 +1383,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Descarga en curso", "Espera a que termine la descarga actual.")
             return
 
-        parsed_name = Path(unquote(urlparse(url).path)).name
-        stem = Path(parsed_name).stem if parsed_name else "video"
-        extension = suggested_extension(url, kind)
+        if source.backend == "yt-dlp" and source.title:
+            stem = re.sub(r'[<>:"/\\|?*]+', "_", source.title).strip(" .") or "video"
+            extension = ".mp4"
+        else:
+            parsed_name = Path(unquote(urlparse(url).path)).name
+            stem = Path(parsed_name).stem if parsed_name else "video"
+            extension = suggested_extension(url, kind)
         default_name = f"{stem or 'video'}{extension}"
         downloads = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
         initial = str(Path(downloads or str(Path.home())) / default_name)
@@ -1372,6 +1525,22 @@ class MainWindow(QMainWindow):
 
             if isinstance(current_bytes, (int, float)) and current_bytes >= 0:
                 lines.append(f"Tamaño: {self._format_bytes(current_bytes)}")
+
+        elif mode == "yt-dlp":
+            current_size = self._format_bytes(current_bytes)
+            if isinstance(total_bytes, (int, float)) and total_bytes > 0:
+                lines.append(
+                    f"Descargado: {current_size} / {self._format_bytes(total_bytes)}"
+                )
+            else:
+                lines.append(f"Descargado: {current_size}")
+
+            if isinstance(speed_bps, (int, float)) and speed_bps > 0:
+                lines.append(f"Velocidad: {self._format_rate(speed_bps)}")
+
+            eta = details.get("eta_seconds")
+            if isinstance(eta, (int, float)) and eta >= 0:
+                lines.append(f"Restante aprox.: {self._format_seconds(eta)}")
 
         elif mode == "http":
             current_size = self._format_bytes(current_bytes)
@@ -1514,6 +1683,7 @@ class MainWindow(QMainWindow):
             self._analysis_thread,
             self._metadata_thread,
             self._manifest_thread,
+            self._specialized_thread,
             self._download_thread,
         ]
         return [
