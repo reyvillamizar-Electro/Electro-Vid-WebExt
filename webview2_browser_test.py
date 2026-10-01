@@ -305,53 +305,13 @@ def main() -> int:
     monitor_started = False
     initial_host = host_of(url)
     guard_state: dict[str, object] = {
-        "enabled": True,
+        "enabled": False,
         "allowed_hosts": {initial_host} if initial_host else set(),
         "handler_installed": False,
         "last_good_url": url,
     }
-    ad_lock = threading.Lock()
-    ad_window: webview.Window | None = None
-
-    def close_ad_window_later(target: webview.Window, delay: float = 1.2) -> None:
-        def worker() -> None:
-            time.sleep(delay)
-            try:
-                target.destroy()
-                print("[AD-SINK] ventana publicitaria cerrada")
-            except Exception:
-                pass
-
-        threading.Thread(
-            target=worker,
-            name="webview2-ad-sink-close",
-            daemon=True,
-        ).start()
-
     def divert_external(uri: str) -> None:
-        nonlocal ad_window
-        with ad_lock:
-            try:
-                if ad_window is not None:
-                    ad_window.destroy()
-            except Exception:
-                pass
-
-            print("[AD-SINK]", uri)
-            ad_window = webview.create_window(
-                "Electro Ad Sink",
-                url=uri,
-                width=2,
-                height=2,
-                x=-10000,
-                y=-10000,
-                hidden=True,
-                focus=False,
-                resizable=False,
-                text_select=False,
-                confirm_close=False,
-            )
-            close_ad_window_later(ad_window)
+        print("[NAV-BLOCKED]", uri)
 
     def on_before_show() -> None:
         install_native_navigation_guard(
@@ -362,8 +322,12 @@ def main() -> int:
 
     window.events.before_show += on_before_show
 
+    outer_hosts = {initial_host} if initial_host else set()
+    last_outer_url = url
+    returning_from_ad = False
+
     def on_loaded() -> None:
-        nonlocal first_codec_report, player_depth, monitor_started
+        nonlocal first_codec_report, player_depth, monitor_started, last_outer_url, returning_from_ad
         try:
             current = window.get_current_url()
         except Exception:
@@ -371,6 +335,29 @@ def main() -> int:
 
         if current:
             print("[PAGE]", current)
+
+        current_host = host_of(current)
+
+        # Before the embedded player has been discovered, let advertising
+        # redirects actually complete, then return through browser history.
+        # This mimics the manual flow and lets the site's ad state/cookies
+        # advance instead of endlessly cancelling and reloading the source.
+        if auto_player and player_depth == 0 and current:
+            if current_host and current_host not in outer_hosts:
+                if not returning_from_ad:
+                    returning_from_ad = True
+                    print("[AD-BACK] publicidad cargada; regresando a:", last_outer_url)
+                    try:
+                        if window.native.webview.CanGoBack:
+                            window.native.webview.GoBack()
+                            return
+                    except Exception:
+                        pass
+                    window.load_url(last_outer_url)
+                    return
+            else:
+                returning_from_ad = False
+                last_outer_url = current
 
         if first_codec_report:
             first_codec_report = False
@@ -394,6 +381,7 @@ def main() -> int:
                 if player_host:
                     allowed_hosts.add(player_host)
                 guard_state["last_good_url"] = player
+                guard_state["enabled"] = True
 
                 # The guard is active from startup. Add each discovered player
                 # host before navigating to it so only the legitimate player
@@ -409,27 +397,19 @@ def main() -> int:
                 window.load_url(player)
                 return
 
-        if auto_player and current:
-            current_host = host_of(current)
+        if auto_player and player_depth >= 1 and current:
             allowed_hosts = guard_state.get("allowed_hosts")
-            if not isinstance(allowed_hosts, set):
-                allowed_hosts = set()
+            if isinstance(allowed_hosts, set):
+                current_host = host_of(current)
+                allowed = any(
+                    current_host == allowed_host
+                    or current_host.endswith("." + allowed_host)
+                    for allowed_host in allowed_hosts
+                    if allowed_host
+                )
+                if allowed:
+                    guard_state["last_good_url"] = current
 
-            allowed = any(
-                current_host == allowed_host
-                or current_host.endswith("." + allowed_host)
-                for allowed_host in allowed_hosts
-                if allowed_host
-            )
-
-            if not allowed:
-                last_good = str(guard_state.get("last_good_url") or url)
-                print("[RECOVER] navegación externa detectada; restaurando:", last_good)
-                window.load_url(last_good)
-                return
-
-            if player_depth >= 1:
-                guard_state["last_good_url"] = current
 
     window.events.loaded += on_loaded
     window.events.request_sent += log_request
@@ -443,7 +423,7 @@ def main() -> int:
     print("Abriendo prueba aislada con Microsoft Edge WebView2…")
     print("URL:", url)
     if "--player" in sys.argv[2:]:
-        print("Modo --player: mantendrá el último player válido y recuperará la ventana si una publicidad logra reemplazarlo.")
+        print("Modo --player: dejará completar la publicidad inicial, volverá automáticamente y bloqueará redirecciones al entrar al player.")
     else:
         print("Se mostrarán los [IFRAME] detectados sin cambiar de página.")
     print("Cierra esta ventana para volver a PowerShell.")
