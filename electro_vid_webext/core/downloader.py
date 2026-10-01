@@ -886,13 +886,11 @@ def _download_with_ffmpeg(
                 origin_header,
             )
 
-            if video_index is None and audio_index is None:
-                raise RuntimeError(
-                    "La fuente HLS no expuso ninguna pista de video/audio válida. "
-                    "La URL probablemente caducó o fue renovada por el reproductor. "
-                    "Activa nuevamente el reproductor y vuelve a intentar la descarga."
-                )
-
+            # FFprobe can fail to describe some ad-obfuscated HLS feeds even
+            # while WebView2 is actively playing them. Do not abort here:
+            # fall back to FFmpeg's automatic video/audio stream selection and
+            # let the MPEG-TS capture path discover codec parameters from real
+            # packets.
             relaxed = list(command)
             input_index = relaxed.index("-i")
             relaxed[input_index:input_index] = [
@@ -958,8 +956,11 @@ def _download_with_ffmpeg(
             if (
                 return_code != 0
                 and (
-                    "dimensions not set" in stderr
+                    video_index is None
+                    or "dimensions not set" in stderr
                     or "Could not write header" in stderr
+                    or "does not contain any stream" in stderr
+                    or "Invalid data found" in stderr
                 )
             ):
                 intermediate_ts = temp_target.with_suffix(".capture.ts")
