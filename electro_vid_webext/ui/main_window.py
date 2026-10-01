@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSlider,
+    QSplitter,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -462,6 +463,8 @@ class MainWindow(QMainWindow):
         back_button = QPushButton("← Atrás")
         reload_button = QPushButton("↻ Recargar")
         rescan_button = QPushButton("Detectar ahora")
+        self.navigation_toggle_button = QPushButton("Mostrar navegación")
+        self.navigation_toggle_button.setCheckable(True)
         browser_note = QLabel(
             "Interactúa con la página o inicia el video; las fuentes de red aparecerán en Resultados."
         )
@@ -499,18 +502,45 @@ class MainWindow(QMainWindow):
         back_button.clicked.connect(self.browser.back)
         reload_button.clicked.connect(self.browser.reload)
         rescan_button.clicked.connect(self.browser.rescan_dom)
+        self.navigation_toggle_button.toggled.connect(self._toggle_navigation_panel)
 
         controls.addWidget(back_button)
         controls.addWidget(reload_button)
         controls.addWidget(rescan_button)
+        controls.addWidget(self.navigation_toggle_button)
         controls.addStretch(1)
+
+        self.navigation_panel = QWidget()
+        nav_layout = QVBoxLayout(self.navigation_panel)
+        nav_layout.setContentsMargins(0, 0, 0, 0)
+        nav_layout.setSpacing(4)
+        nav_layout.addWidget(QLabel("Navegación detectada / redirecciones"))
+        nav_layout.addWidget(self.navigation_table)
+        self.navigation_panel.hide()
+
+        self.browser_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.browser_splitter.setChildrenCollapsible(False)
+        self.browser_splitter.addWidget(self.browser)
+        self.browser_splitter.addWidget(self.navigation_panel)
+        self.browser_splitter.setStretchFactor(0, 5)
+        self.browser_splitter.setStretchFactor(1, 1)
 
         layout.addLayout(controls)
         layout.addWidget(browser_note)
-        layout.addWidget(self.browser, 1)
-        layout.addWidget(QLabel("Navegación detectada / redirecciones"))
-        layout.addWidget(self.navigation_table)
+        layout.addWidget(self.browser_splitter, 1)
         return page
+
+    @Slot(bool)
+    def _toggle_navigation_panel(self, visible: bool) -> None:
+        self.navigation_panel.setVisible(visible)
+        self.navigation_toggle_button.setText(
+            "Ocultar navegación" if visible else "Mostrar navegación"
+        )
+        if visible:
+            height = max(self.browser_splitter.height(), 600)
+            self.browser_splitter.setSizes(
+                [max(360, int(height * 0.72)), max(140, int(height * 0.28))]
+            )
 
     @Slot(object)
     def _browser_navigation_event(self, event: object) -> None:
