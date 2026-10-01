@@ -111,3 +111,16 @@ La columna **Protección** marca señales reconocibles de Widevine, PlayReady o 
 ## Uso responsable
 
 La herramienta está pensada para trabajar con fuentes multimedia accesibles normalmente por el navegador y para contenido que el usuario tenga permiso de reproducir o guardar. No intenta eludir DRM ni controles de acceso.
+
+
+## Extractores especializados
+
+Electro Vid-WebExt puede usar dos estrategias de extracción:
+
+- **Automático**: intenta detectar un extractor específico de yt-dlp y mantiene el navegador/red como respaldo.
+- **Genérico · navegador/red**: usa únicamente la detección HTML, DOM y tráfico de QtWebEngine.
+- **yt-dlp · especializado**: fuerza el backend especializado para sitios compatibles.
+
+Cuando yt-dlp reconoce una plataforma, la aplicación muestra distintas calidades como fuentes seleccionables. Las descargas conservan el `format_id` seleccionado; si el video y el audio vienen separados, yt-dlp y FFmpeg los combinan al guardar.
+
+El backend especializado se integra mediante la API Python de yt-dlp. Algunos sitios pueden cambiar sus mecanismos de reproducción, firmas o tokens, por lo que mantener yt-dlp actualizado ayuda a conservar compatibilidad.
