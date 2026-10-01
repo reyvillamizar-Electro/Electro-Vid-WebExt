@@ -30,7 +30,12 @@ from PySide6.QtWidgets import (
 )
 
 from electro_vid_webext.core.detector import VideoSource, detect_video_sources, media_kind_from_url
-from electro_vid_webext.core.downloader import DownloadCancelled, download_media, suggested_extension
+from electro_vid_webext.core.downloader import (
+    DownloadCancelled,
+    download_media,
+    suggested_extension,
+    temporary_download_path,
+)
 from electro_vid_webext.core.manifest import inspect_manifest
 from electro_vid_webext.core.metadata import MediaMetadata, ffprobe_available, read_media_metadata
 from electro_vid_webext.core.mpv_player import MPVController, MPVError
@@ -201,6 +206,10 @@ class MainWindow(QMainWindow):
         self._download_thread: QThread | None = None
         self._download_worker: DownloadWorker | None = None
         self._download_dialog: QProgressDialog | None = None
+        self._download_destination: str | None = None
+        self._download_temp_path: Path | None = None
+        self._download_destination_existed_before = False
+        self._download_cancel_requested = False
         self._last_download_path: str | None = None
 
         self._sources: list[VideoSource] = []
@@ -792,9 +801,18 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _analysis_failed(self, message: str) -> None:
-        self.status_label.setText("No se pudo analizar la página.")
         self.analyze_button.setEnabled(True)
-        QMessageBox.warning(self, "Error de análisis", message)
+
+        if self._sources:
+            self.status_label.setText(
+                f"El análisis HTML respondió con error ({message}), "
+                f"pero el navegador detectó {len(self._sources)} fuente(s)."
+            )
+            return
+
+        self.status_label.setText(
+            "El análisis HTML falló; el navegador seguirá buscando fuentes dinámicas."
+        )
 
     @Slot()
     def _cleanup_analysis_thread(self) -> None:
@@ -1139,11 +1157,24 @@ class MainWindow(QMainWindow):
         if not destination:
             return
 
-        self._download_dialog = QProgressDialog("Descargando video…", "", 0, 100, self)
+        self._download_destination = destination
+        self._download_temp_path = temporary_download_path(destination)
+        self._download_destination_existed_before = Path(destination).exists()
+        self._download_cancel_requested = False
+
+        self._download_dialog = QProgressDialog(
+            "Descargando video…",
+            "Cancelar",
+            0,
+            100,
+            self,
+        )
         self._download_dialog.setWindowTitle("Electro Vid-WebExt")
-        self._download_dialog.setCancelButton(None)
         self._download_dialog.setMinimumDuration(0)
+        self._download_dialog.setAutoClose(False)
+        self._download_dialog.setAutoReset(False)
         self._download_dialog.setValue(0)
+        self._download_dialog.canceled.connect(self.cancel_download)
 
         self._download_thread = QThread(self)
         self._download_worker = DownloadWorker(source, destination)
@@ -1159,6 +1190,45 @@ class MainWindow(QMainWindow):
         self._download_thread.finished.connect(self._cleanup_download)
         self._download_thread.start()
 
+    @Slot()
+    def cancel_download(self) -> None:
+        if not self._download_thread or not self._download_thread.isRunning():
+            return
+        if self._download_cancel_requested:
+            return
+
+        self._download_cancel_requested = True
+        self.status_label.setText("Cancelando descarga…")
+
+        if self._download_dialog is not None:
+            self._download_dialog.setLabelText(
+                "Cancelando descarga y eliminando archivo parcial…"
+            )
+            self._download_dialog.setCancelButton(None)
+
+        self._download_thread.requestInterruption()
+
+    def _cleanup_current_download_files(self) -> None:
+        temp_path = self._download_temp_path
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        if (
+            self._download_cancel_requested
+            and self._download_destination
+            and not self._download_destination_existed_before
+        ):
+            target = Path(self._download_destination)
+            # Normally the final target is never created before a successful
+            # validation/rename. This is an extra safeguard for cancellation.
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     @Slot(int)
     def _download_progress(self, value: int) -> None:
         if self._download_dialog is None:
@@ -1173,6 +1243,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _download_finished(self, destination: str) -> None:
+        self._download_cancel_requested = False
         if self._download_dialog is not None:
             self._download_dialog.setRange(0, 100)
             self._download_dialog.setValue(100)
@@ -1195,11 +1266,21 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _download_failed(self, message: str) -> None:
+        cancelled = message == "Descarga cancelada." or self._download_cancel_requested
+
+        if cancelled:
+            self._cleanup_current_download_files()
+
         if self._download_dialog is not None:
             self._download_dialog.close()
 
-        if self._closing and message == "Descarga cancelada.":
-            self.status_label.setText("Cerrando…")
+        if cancelled:
+            if self._closing:
+                self.status_label.setText("Cerrando…")
+            else:
+                self.status_label.setText(
+                    "Descarga cancelada. Se eliminó el archivo parcial de este intento."
+                )
             return
 
         self.status_label.setText("La descarga falló.")
@@ -1210,6 +1291,10 @@ class MainWindow(QMainWindow):
         self._download_thread = None
         self._download_worker = None
         self._download_dialog = None
+        self._download_destination = None
+        self._download_temp_path = None
+        self._download_destination_existed_before = False
+        self._download_cancel_requested = False
 
     @Slot()
     def open_download_folder(self) -> None:
