@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import threading
-import time
 from urllib.parse import urlparse
 
 import webview
@@ -96,27 +94,13 @@ def install_native_navigation_guard(
         print(f"[GUARD] no se pudo instalar: {exc}")
 
 
-def install_native_new_window_handler(
-    window: webview.Window,
+def _attach_popup_handler_to_core(
+    core,
     state: dict[str, object],
 ) -> None:
-    try:
-        native_webview = window.native.webview
-    except Exception as exc:
-        print(f"[POPUP] WebView2 nativo no disponible: {exc}")
-        return
-
     if state.get("popup_handler_installed"):
         return
-
-    try:
-        core = native_webview.CoreWebView2
-    except Exception as exc:
-        print(f"[POPUP] CoreWebView2 no disponible todavía: {exc}")
-        return
-
     if core is None:
-        print("[POPUP] CoreWebView2 todavía no está inicializado")
         return
 
     def on_new_window_requested(sender, args) -> None:
@@ -128,9 +112,6 @@ def install_native_new_window_handler(
         if uri:
             print("[POPUP-HANDLED]", uri)
 
-        # NewWindowRequested belongs to CoreWebView2. Marking Handled keeps
-        # the current document alive and prevents WebView2 from creating or
-        # forwarding the popup.
         try:
             args.Handled = True
         except Exception:
@@ -149,82 +130,61 @@ def install_native_new_window_handler(
         print(f"[POPUP] no se pudo instalar en CoreWebView2: {exc}")
 
 
+def install_native_new_window_handler(
+    window: webview.Window,
+    state: dict[str, object],
+) -> None:
+    try:
+        native_webview = window.native.webview
+    except Exception as exc:
+        print(f"[POPUP] WebView2 nativo no disponible: {exc}")
+        return
+
+    if state.get("popup_handler_installed"):
+        return
+
+    try:
+        core = native_webview.CoreWebView2
+    except Exception:
+        core = None
+
+    if core is not None:
+        _attach_popup_handler_to_core(core, state)
+        return
+
+    if state.get("popup_init_handler_installed"):
+        return
+
+    def on_core_initialized(sender, args) -> None:
+        try:
+            success = bool(args.IsSuccess)
+        except Exception:
+            success = True
+
+        if not success:
+            print("[POPUP] CoreWebView2InitializationCompleted falló")
+            return
+
+        try:
+            initialized_core = sender.CoreWebView2
+        except Exception as exc:
+            print(f"[POPUP] no se pudo obtener CoreWebView2 inicializado: {exc}")
+            return
+
+        _attach_popup_handler_to_core(initialized_core, state)
+
+    try:
+        native_webview.CoreWebView2InitializationCompleted += on_core_initialized
+        state["popup_init_handler_installed"] = True
+        state["popup_init_handler"] = on_core_initialized
+        print("[POPUP] esperando CoreWebView2InitializationCompleted")
+    except Exception as exc:
+        print(f"[POPUP] no se pudo escuchar la inicialización: {exc}")
+
 def host_of(value: str | None) -> str:
     if not value:
         return ""
     return (urlparse(value).hostname or "").lower()
-
-
-def media_snapshot(window: webview.Window) -> list[str]:
-    try:
-        raw = window.evaluate_js(
-            """
-            (() => {
-              const values = new Set();
-              const add = (value) => {
-                if (!value || typeof value !== 'string') return;
-                if (value.startsWith('blob:') || value.startsWith('data:')) return;
-                values.add(value);
-              };
-
-              document.querySelectorAll('video').forEach(video => {
-                add(video.currentSrc);
-                add(video.src);
-              });
-              document.querySelectorAll('source').forEach(source => add(source.src));
-
-              try {
-                performance.getEntriesByType('resource').forEach(entry => {
-                  add(entry.name);
-                });
-              } catch (_) {}
-
-              return JSON.stringify(Array.from(values));
-            })();
-            """
-        )
-        if isinstance(raw, str):
-            values = json.loads(raw)
-        elif isinstance(raw, list):
-            values = raw
-        else:
-            values = []
-    except Exception:
-        return []
-
-    result = []
-    for value in values:
-        if not isinstance(value, str):
-            continue
-        lower = value.lower()
-        if any(marker in lower for marker in MEDIA_MARKERS):
-            result.append(value)
-    return result
-
-
-def start_media_monitor(window: webview.Window) -> None:
-    def worker() -> None:
-        seen: set[str] = set()
-        while True:
-            try:
-                values = media_snapshot(window)
-            except Exception:
-                values = []
-
-            for value in values:
-                if value in seen:
-                    continue
-                seen.add(value)
-                print("[MEDIA-DOM]", value)
-
-            time.sleep(1.0)
-
-    thread = threading.Thread(
-        target=worker,
-        name="webview2-media-monitor",
-        daemon=True,
-    )
-    thread.start()
 
 
 def iframe_report(window: webview.Window) -> list[str]:
@@ -355,7 +315,6 @@ def main() -> int:
     auto_player = "--player" in sys.argv[2:]
     visited_players: set[str] = set()
     player_depth = 0
-    monitor_started = False
     initial_host = host_of(url)
     guard_state: dict[str, object] = {
         "enabled": False,
@@ -363,6 +322,7 @@ def main() -> int:
         "handler_installed": False,
         "last_good_url": url,
         "popup_handler_installed": False,
+        "popup_init_handler_installed": False,
     }
     def divert_external(uri: str) -> None:
         print("[NAV-BLOCKED]", uri)
@@ -378,7 +338,7 @@ def main() -> int:
     window.events.before_show += on_before_show
 
     def on_loaded() -> None:
-        nonlocal first_codec_report, player_depth, monitor_started
+        nonlocal first_codec_report, player_depth
         try:
             current = window.get_current_url()
         except Exception:
@@ -395,10 +355,6 @@ def main() -> int:
         if first_codec_report:
             first_codec_report = False
             codec_report(window)
-
-        if not monitor_started:
-            monitor_started = True
-            start_media_monitor(window)
 
         frames = iframe_report(window)
         if auto_player and player_depth < 5:
@@ -456,7 +412,7 @@ def main() -> int:
     print("Abriendo prueba aislada con Microsoft Edge WebView2…")
     print("URL:", url)
     if "--player" in sys.argv[2:]:
-        print("Modo --player: mantendrá viva la página principal, atenderá popups con NewWindowRequested y bloqueará redirecciones al entrar al player.")
+        print("Modo --player: esperará la inicialización completa de WebView2, atenderá popups sin salir de la página y seguirá la cadena del player.")
     else:
         print("Se mostrarán los [IFRAME] detectados sin cambiar de página.")
     print("Cierra esta ventana para volver a PowerShell.")
