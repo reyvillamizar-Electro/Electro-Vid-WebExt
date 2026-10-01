@@ -656,6 +656,10 @@ class MainWindow(QMainWindow):
             self.status_label.setText(
                 "La página intentó abrir otra ventana; se registró sin permitir que tome el control."
             )
+        elif event_name == "SSL bloqueado":
+            self.status_label.setText(
+                "Se bloqueó un recurso con certificado SSL inválido; revisa Navegación para ver el dominio."
+            )
 
     @Slot(str)
     def _embedded_page_found(self, url: str) -> None:
