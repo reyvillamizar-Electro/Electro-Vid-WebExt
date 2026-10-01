@@ -288,6 +288,7 @@ class MainWindow(QMainWindow):
         self._sources: list[VideoSource] = []
         self._known_urls: set[str] = set()
         self._source_by_url: dict[str, VideoSource] = {}
+        self._latest_source_by_family: dict[str, VideoSource] = {}
         self._pending_metadata: dict[str, VideoSource] = {}
         self._pending_manifests: dict[str, VideoSource] = {}
 
@@ -302,6 +303,7 @@ class MainWindow(QMainWindow):
         self._fullscreen_preview = False
         self._closing = False
         self._browser_shutdown = False
+        self._pending_fresh_action: tuple[str, VideoSource] | None = None
 
         self._build_ui()
 
@@ -794,6 +796,7 @@ class MainWindow(QMainWindow):
         self._sources = []
         self._known_urls = set()
         self._source_by_url = {}
+        self._latest_source_by_family = {}
         self._pending_metadata = {}
         self._pending_manifests = {}
         self._embedded_queue = []
@@ -928,9 +931,100 @@ class MainWindow(QMainWindow):
             )
             self._update_analyze_enabled()
 
+    @staticmethod
+    def _source_family_key(source: VideoSource) -> str:
+        parsed = urlparse(source.url)
+        kind = source.kind.upper()
+
+        # Streaming URLs commonly rotate query tokens/signatures while the
+        # underlying manifest path stays the same. Treat those as one live
+        # source family. Direct files keep their full URL identity.
+        if kind in {"HLS", "DASH"}:
+            host = (parsed.hostname or "").lower()
+            path = parsed.path or "/"
+            return f"{kind}|{host}|{path}"
+
+        return f"{kind}|{source.url}"
+
+    def _remember_latest_source(self, source: VideoSource) -> None:
+        family = self._source_family_key(source)
+        self._latest_source_by_family[family] = source
+
+    def _freshest_source(self, source: VideoSource) -> VideoSource:
+        family = self._source_family_key(source)
+        latest = self._latest_source_by_family.get(family)
+        if latest is None:
+            return source
+
+        # Keep quality/variant metadata from the selected row if the refreshed
+        # network URL did not carry it.
+        return replace(
+            latest,
+            quality_hint=(
+                source.quality_hint
+                if source.quality_hint != "—"
+                else latest.quality_hint
+            ),
+            resolution_hint=(
+                source.resolution_hint
+                if source.resolution_hint != "—"
+                else latest.resolution_hint
+            ),
+            protection=(
+                source.protection
+                if source.protection != "—"
+                else latest.protection
+            ),
+            origin=source.origin,
+            backend=source.backend,
+            extractor_key=source.extractor_key or latest.extractor_key,
+            format_id=source.format_id or latest.format_id,
+            format_selector=source.format_selector or latest.format_selector,
+            webpage_url=source.webpage_url or latest.webpage_url,
+            title=source.title or latest.title,
+            audio_url=source.audio_url or latest.audio_url,
+        )
+
+    def _run_with_fresh_source(self, action: str, source: VideoSource) -> None:
+        if source.kind.upper() not in {"HLS", "DASH"}:
+            if action == "preview":
+                self._preview_source_now(source)
+            else:
+                self._run_with_fresh_source("download", source)
+            return
+
+        self._pending_fresh_action = (action, source)
+        self.status_label.setText(
+            "Actualizando la fuente temporal antes de usarla…"
+        )
+        self.browser.rescan_dom()
+        QTimer.singleShot(650, self._finish_fresh_source_action)
+
+    @Slot()
+    def _finish_fresh_source_action(self) -> None:
+        pending = self._pending_fresh_action
+        self._pending_fresh_action = None
+        if pending is None:
+            return
+
+        action, selected = pending
+        source = self._freshest_source(selected)
+
+        if source.url != selected.url:
+            self.status_label.setText(
+                "Se detectó una URL renovada para esta fuente; usando la versión más reciente."
+            )
+
+        if action == "preview":
+            self._preview_source_now(source)
+        else:
+            self._start_download(source)
+
     def _add_source(self, source: VideoSource) -> bool:
         if not source.url:
             return False
+
+        self._remember_latest_source(source)
 
         if source.url in self._known_urls:
             existing = self._source_by_url.get(source.url)
@@ -1295,7 +1389,9 @@ class MainWindow(QMainWindow):
         if source is None:
             QMessageBox.information(self, "Selecciona un video", "Selecciona una fila primero.")
             return
+        self._run_with_fresh_source("preview", source)
 
+    def _preview_source_now(self, source: VideoSource) -> None:
         if source.protection.startswith("DRM"):
             QMessageBox.warning(
                 self,
@@ -1514,7 +1610,7 @@ class MainWindow(QMainWindow):
                 "Previsualiza un video antes de descargarlo desde el reproductor.",
             )
             return
-        self._start_download(self._preview_source)
+        self._run_with_fresh_source("download", self._preview_source)
 
     def _start_download(self, source: VideoSource) -> None:
         if source.protection.startswith("DRM"):
