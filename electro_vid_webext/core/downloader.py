@@ -39,7 +39,7 @@ def download_media(
     cookie_header: str | None = None,
     origin_header: str | None = None,
 ) -> None:
-    """Download a media URL, validating direct HTTP and falling back to FFmpeg."""
+    """Download media with browser session context and validate the result."""
     suffix = Path(urlparse(url).path).suffix.lower()
     is_stream = kind.upper() in {"HLS", "DASH"} or suffix in {".m3u8", ".mpd"}
 
@@ -68,19 +68,25 @@ def download_media(
     except Exception as direct_error:
         try:
             _download_with_ffmpeg(
-            url,
-            destination,
-            progress,
-            referer,
-            user_agent,
-            cookie_header,
-            origin_header,
-        )
+                url,
+                destination,
+                progress,
+                referer,
+                user_agent,
+                cookie_header,
+                origin_header,
+            )
         except Exception as ffmpeg_error:
             raise RuntimeError(
                 "La descarga HTTP directa no produjo un video válido y el intento con "
                 f"FFmpeg también falló.\n\nHTTP: {direct_error}\n\nFFmpeg: {ffmpeg_error}"
             ) from ffmpeg_error
+
+
+def _clean_header_value(value: str | None) -> str | None:
+    if not value:
+        return None
+    return value.replace("\r", " ").replace("\n", " ").strip()
 
 
 def _headers(
@@ -90,10 +96,15 @@ def _headers(
     origin_header: str | None = None,
 ) -> dict[str, str]:
     headers = {
-        "User-Agent": user_agent or USER_AGENT,
+        "User-Agent": _clean_header_value(user_agent) or USER_AGENT,
         "Accept": "*/*",
         "Accept-Encoding": "identity",
     }
+
+    referer = _clean_header_value(referer)
+    cookie_header = _clean_header_value(cookie_header)
+    origin_header = _clean_header_value(origin_header)
+
     if referer:
         headers["Referer"] = referer
     if cookie_header:
@@ -103,7 +114,6 @@ def _headers(
     return headers
 
 
-
 def _select_best_hls_variant(
     url: str,
     referer: str | None,
@@ -111,7 +121,6 @@ def _select_best_hls_variant(
     cookie_header: str | None,
     origin_header: str | None,
 ) -> str:
-    """Return the highest-quality variant from an HLS master playlist when possible."""
     if not urlparse(url).path.lower().endswith(".m3u8"):
         return url
 
@@ -158,14 +167,14 @@ def _select_best_hls_variant(
             break
 
         if variant_url:
-            pixels = width * height
-            variants.append((pixels, bandwidth, variant_url))
+            variants.append((width * height, bandwidth, variant_url))
 
     if not variants:
         return url
 
     variants.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return variants[0][2]
+
 
 def _temporary_target(destination: str) -> Path:
     target = Path(destination)
@@ -177,8 +186,7 @@ def _validate_download(path: Path, content_type: str = "") -> None:
     if not path.exists():
         raise RuntimeError("El servidor no creó ningún archivo.")
 
-    size = path.stat().st_size
-    if size <= 0:
+    if path.stat().st_size <= 0:
         raise RuntimeError("El servidor devolvió un archivo vacío.")
 
     normalized = content_type.lower().split(";", 1)[0].strip()
@@ -266,7 +274,6 @@ def _download_direct(
 
         _validate_download(temp_target, content_type)
         temp_target.replace(target)
-
         if progress:
             progress(100)
     except Exception:
@@ -310,16 +317,20 @@ def _download_with_ffmpeg(
         "error",
         "-y",
         "-user_agent",
-        user_agent or USER_AGENT,
+        _clean_header_value(user_agent) or USER_AGENT,
     ]
-    if referer:
-        command.extend(["-referer", referer])
+
+    clean_referer = _clean_header_value(referer)
+    if clean_referer:
+        command.extend(["-referer", clean_referer])
 
     extra_headers: list[str] = []
-    if cookie_header:
-        extra_headers.append(f"Cookie: {cookie_header}")
-    if origin_header:
-        extra_headers.append(f"Origin: {origin_header}")
+    clean_cookie = _clean_header_value(cookie_header)
+    clean_origin = _clean_header_value(origin_header)
+    if clean_cookie:
+        extra_headers.append(f"Cookie: {clean_cookie}")
+    if clean_origin:
+        extra_headers.append(f"Origin: {clean_origin}")
     if extra_headers:
         command.extend(["-headers", "\r\n".join(extra_headers) + "\r\n"])
 
@@ -351,7 +362,6 @@ def _download_with_ffmpeg(
 
         _validate_download(temp_target)
         temp_target.replace(target)
-
         if progress:
             progress(100)
     except Exception:
