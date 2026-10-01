@@ -21,6 +21,9 @@ def _harden_chromium() -> None:
         disable = "--disable-features=" + ",".join(sorted(features))
         flags = f"{flags} {disable}".strip()
 
+    if "--log-level=" not in flags:
+        flags = f"{flags} --log-level=3".strip()
+
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = flags
 
 
