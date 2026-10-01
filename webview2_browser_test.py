@@ -308,6 +308,7 @@ def main() -> int:
         "enabled": True,
         "allowed_hosts": {initial_host} if initial_host else set(),
         "handler_installed": False,
+        "last_good_url": url,
     }
     ad_lock = threading.Lock()
     ad_window: webview.Window | None = None
@@ -383,7 +384,6 @@ def main() -> int:
         if auto_player and player_depth < 5:
             player = choose_player_iframe(frames)
             if player and player not in visited_players:
-                current_host = host_of(current)
                 player_host = host_of(player)
 
                 allowed_hosts = guard_state.get("allowed_hosts")
@@ -391,10 +391,9 @@ def main() -> int:
                     allowed_hosts = set()
                     guard_state["allowed_hosts"] = allowed_hosts
 
-                if current_host:
-                    allowed_hosts.add(current_host)
                 if player_host:
                     allowed_hosts.add(player_host)
+                guard_state["last_good_url"] = player
 
                 # The guard is active from startup. Add each discovered player
                 # host before navigating to it so only the legitimate player
@@ -410,11 +409,27 @@ def main() -> int:
                 window.load_url(player)
                 return
 
-        if auto_player and player_depth >= 1:
+        if auto_player and current:
             current_host = host_of(current)
             allowed_hosts = guard_state.get("allowed_hosts")
-            if isinstance(allowed_hosts, set) and current_host:
-                allowed_hosts.add(current_host)
+            if not isinstance(allowed_hosts, set):
+                allowed_hosts = set()
+
+            allowed = any(
+                current_host == allowed_host
+                or current_host.endswith("." + allowed_host)
+                for allowed_host in allowed_hosts
+                if allowed_host
+            )
+
+            if not allowed:
+                last_good = str(guard_state.get("last_good_url") or url)
+                print("[RECOVER] navegación externa detectada; restaurando:", last_good)
+                window.load_url(last_good)
+                return
+
+            if player_depth >= 1:
+                guard_state["last_good_url"] = current
 
     window.events.loaded += on_loaded
     window.events.request_sent += log_request
@@ -428,7 +443,7 @@ def main() -> int:
     print("Abriendo prueba aislada con Microsoft Edge WebView2…")
     print("URL:", url)
     if "--player" in sys.argv[2:]:
-        print("Modo --player: mantendrá el player en la ventana principal y desviará publicidad a una WebView oculta.")
+        print("Modo --player: mantendrá el último player válido y recuperará la ventana si una publicidad logra reemplazarlo.")
     else:
         print("Se mostrarán los [IFRAME] detectados sin cambiar de página.")
     print("Cierra esta ventana para volver a PowerShell.")
