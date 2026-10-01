@@ -113,6 +113,8 @@ class MediaRequestInterceptor(QWebEngineUrlRequestInterceptor):
 
 
 class QuietWebEnginePage(QWebEnginePage):
+    certificate_problem = Signal(object)
+
     def __init__(self, profile: QWebEngineProfile, parent=None) -> None:
         super().__init__(profile, parent)
 
@@ -121,6 +123,10 @@ class QuietWebEnginePage(QWebEnginePage):
         self.permissionRequested.connect(self._deny_permission)
         self.webAuthUxRequested.connect(self._cancel_webauth)
         self.fileSystemAccessRequested.connect(self._reject_file_system_access)
+        try:
+            self.certificateError.connect(self._reject_certificate_error)
+        except Exception:
+            pass
 
     @staticmethod
     def _deny_permission(permission) -> None:
@@ -142,6 +148,40 @@ class QuietWebEnginePage(QWebEnginePage):
             request.reject()
         except Exception:
             pass
+
+    def _reject_certificate_error(self, error) -> None:
+        url = ""
+        description = ""
+        error_type = "Certificado inválido"
+
+        try:
+            url = error.url().toString()
+        except Exception:
+            pass
+
+        try:
+            description = str(error.description() or "")
+        except Exception:
+            pass
+
+        try:
+            error_type = str(error.type()).split(".")[-1]
+        except Exception:
+            pass
+
+        try:
+            error.rejectCertificate()
+        except Exception:
+            pass
+
+        self.certificate_problem.emit(
+            {
+                "event": "SSL bloqueado",
+                "url": url,
+                "detail": description or error_type,
+                "error_type": error_type,
+            }
+        )
 
     def chooseFiles(self, mode, old_files, accepted_mime_types):
         # Do not allow web pages to open local file pickers from extractor mode.
@@ -211,6 +251,8 @@ class BrowserView(QWebEngineView):
         self.profile.setUrlRequestInterceptor(self.interceptor)
 
         page = self.page()
+        if isinstance(page, QuietWebEnginePage):
+            page.certificate_problem.connect(self._on_certificate_problem)
         page.navigationRequested.connect(self._on_navigation_requested)
         page.newWindowRequested.connect(self._on_new_window_requested)
         self.urlChanged.connect(self._on_url_changed)
@@ -312,6 +354,19 @@ class BrowserView(QWebEngineView):
             }
         )
         self.setUrl(QUrl(url))
+
+    def _on_certificate_problem(self, problem: object) -> None:
+        if not isinstance(problem, dict):
+            return
+
+        self.navigation_event.emit(
+            {
+                "event": str(problem.get("event") or "SSL bloqueado"),
+                "from": self.url().toString(),
+                "to": str(problem.get("url") or ""),
+                "detail": str(problem.get("detail") or problem.get("error_type") or ""),
+            }
+        )
 
     def _on_embedded_page_seen(self, url: str) -> None:
         if not url or url in self._embedded_seen:
