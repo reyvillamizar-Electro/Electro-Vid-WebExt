@@ -129,3 +129,8 @@ El backend especializado se integra mediante la API Python de yt-dlp. Algunos si
 ### YouTube y runtime JavaScript
 
 El soporte completo actual de YouTube en yt-dlp utiliza `yt-dlp-ejs` y un runtime JavaScript externo. Electro Vid-WebExt instala `yt-dlp[default]`, que incluye EJS, y detecta automáticamente Deno, Node o QuickJS disponibles en el sistema. Deno es el runtime recomendado por yt-dlp. Si no se detecta ninguno, la app puede seguir intentando la extracción, pero YouTube puede ocultar o limitar algunos formatos.
+
+
+### Certificados HTTPS
+
+El navegador integrado rechaza certificados HTTPS inválidos en lugar de ignorarlos. Cuando un recurso o reproductor externo presenta un certificado no confiable o mal formado, la pestaña **Navegador** lo registra en el historial como **SSL bloqueado** con la URL y el motivo disponible. Los mensajes internos repetitivos de Chromium se reducen en la terminal, pero los eventos relevantes siguen visibles dentro de la aplicación.
