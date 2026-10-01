@@ -170,6 +170,7 @@ class MPVController:
         user_agent: str | None = None,
         cookie_header: str | None = None,
         origin_header: str | None = None,
+        audio_url: str | None = None,
     ) -> None:
         options: dict[str, Any] = {"hls-bitrate": "max"}
 
@@ -185,6 +186,8 @@ class MPVController:
             header_fields.append(f"Origin: {origin_header}")
         if header_fields:
             options["http-header-fields"] = header_fields
+        if audio_url:
+            options["audio-file"] = audio_url
 
         self.command("loadfile", url, "replace", -1, options)
 
