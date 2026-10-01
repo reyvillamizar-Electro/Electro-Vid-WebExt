@@ -41,10 +41,28 @@ def _bytes_text(value) -> str:
 
 class MediaRequestInterceptor(QWebEngineUrlRequestInterceptor):
     media_found = Signal(object)
+    navigation_seen = Signal(object)
 
     def interceptRequest(self, info: QWebEngineUrlRequestInfo) -> None:
         url = info.requestUrl().toString()
         kind = media_kind_from_url(url)
+
+        try:
+            is_main_frame = (
+                info.resourceType()
+                == QWebEngineUrlRequestInfo.ResourceType.ResourceTypeMainFrame
+            )
+        except Exception:
+            is_main_frame = False
+
+        if is_main_frame:
+            self.navigation_seen.emit(
+                {
+                    "event": "Solicitud principal",
+                    "url": url,
+                    "first_party": info.firstPartyUrl().toString(),
+                }
+            )
 
         is_media_resource = (
             info.resourceType() == QWebEngineUrlRequestInfo.ResourceType.ResourceTypeMedia
@@ -128,12 +146,15 @@ class QuietWebEnginePage(QWebEnginePage):
 
 class BrowserView(QWebEngineView):
     media_found = Signal(object)
+    navigation_event = Signal(object)
     page_ready = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
 
         self._cookies: dict[tuple[str, str, str], _CookieRecord] = {}
+        self._initial_url = ""
+        self._last_url = ""
 
         # Clear data from the older versions that used Qt's default profile.
         # This profile is not used for browsing anymore.
@@ -163,7 +184,14 @@ class BrowserView(QWebEngineView):
 
         self.interceptor = MediaRequestInterceptor(self)
         self.interceptor.media_found.connect(self._on_network_media)
+        self.interceptor.navigation_seen.connect(self._on_navigation_seen)
         self.profile.setUrlRequestInterceptor(self.interceptor)
+
+        page = self.page()
+        page.navigationRequested.connect(self._on_navigation_requested)
+        page.newWindowRequested.connect(self._on_new_window_requested)
+        self.urlChanged.connect(self._on_url_changed)
+        self.loadStarted.connect(self._on_load_started)
 
         cookie_store = self.profile.cookieStore()
         cookie_store.cookieAdded.connect(self._cookie_added)
@@ -248,7 +276,127 @@ class BrowserView(QWebEngineView):
             pass
 
     def load_page(self, url: str) -> None:
+        self._initial_url = url
+        self._last_url = ""
+        self.navigation_event.emit(
+            {
+                "event": "URL inicial",
+                "from": "",
+                "to": url,
+                "detail": "Solicitada por Electro Vid-WebExt",
+            }
+        )
         self.setUrl(QUrl(url))
+
+    def _on_navigation_seen(self, context: object) -> None:
+        if not isinstance(context, dict):
+            return
+        url = str(context.get("url") or "")
+        if not url:
+            return
+        self.navigation_event.emit(
+            {
+                "event": str(context.get("event") or "Solicitud principal"),
+                "from": str(context.get("first_party") or ""),
+                "to": url,
+                "detail": "Solicitud de documento principal observada en red",
+            }
+        )
+
+    def _on_navigation_requested(self, request) -> None:
+        try:
+            if not request.isMainFrame():
+                return
+            url = request.url().toString()
+            navigation_type = str(request.navigationType()).split(".")[-1]
+        except Exception:
+            return
+
+        self.navigation_event.emit(
+            {
+                "event": "Navegación",
+                "from": self.url().toString(),
+                "to": url,
+                "detail": navigation_type,
+            }
+        )
+
+    def _on_new_window_requested(self, request) -> None:
+        try:
+            url = request.requestedUrl().toString()
+            destination = str(request.destination()).split(".")[-1]
+            initiated = bool(request.isUserInitiated())
+        except Exception:
+            return
+
+        self.navigation_event.emit(
+            {
+                "event": "Popup / nueva ventana",
+                "from": self.url().toString(),
+                "to": url,
+                "detail": (
+                    f"{destination} · "
+                    + ("iniciado por usuario" if initiated else "automático/bloqueado")
+                ),
+            }
+        )
+
+        kind = media_kind_from_url(url)
+        if kind:
+            self.media_found.emit(
+                self.session_source(
+                    url=url,
+                    kind=kind,
+                    origin=f"Popup · {kind}",
+                    referer=self.url().toString() or None,
+                )
+            )
+
+        # Intentionally do not call request.openIn(): extractor mode records
+        # the target but does not allow arbitrary popups to take over the UI.
+
+    def _on_load_started(self) -> None:
+        requested = ""
+        try:
+            requested = self.page().requestedUrl().toString()
+        except Exception:
+            pass
+
+        self.navigation_event.emit(
+            {
+                "event": "Carga iniciada",
+                "from": self._last_url,
+                "to": requested or self.url().toString(),
+                "detail": "",
+            }
+        )
+
+    def _on_url_changed(self, url: QUrl) -> None:
+        current = url.toString()
+        previous = self._last_url
+        if current == previous:
+            return
+
+        requested = ""
+        try:
+            requested = self.page().requestedUrl().toString()
+        except Exception:
+            pass
+
+        redirected = bool(requested and current and requested != current)
+        self.navigation_event.emit(
+            {
+                "event": "Redirección" if redirected else "URL cambió",
+                "from": previous,
+                "to": current,
+                "detail": (
+                    f"Solicitada originalmente: {requested}"
+                    if redirected
+                    else ""
+                ),
+            }
+        )
+        self._last_url = current
 
     def session_source(
         self,
@@ -323,6 +471,26 @@ class BrowserView(QWebEngineView):
         self.media_found.emit(source)
 
     def _on_load_finished(self, ok: bool) -> None:
+        final_url = self.url().toString()
+        requested = ""
+        try:
+            requested = self.page().requestedUrl().toString()
+        except Exception:
+            pass
+
+        self.navigation_event.emit(
+            {
+                "event": "Carga completada" if ok else "Carga fallida",
+                "from": requested,
+                "to": final_url,
+                "detail": (
+                    "URL final distinta de la solicitada"
+                    if requested and final_url and requested != final_url
+                    else ""
+                ),
+            }
+        )
+
         if not ok:
             return
         self.rescan_dom()
