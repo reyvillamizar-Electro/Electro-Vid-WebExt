@@ -190,10 +190,14 @@ def _select_best_hls_variant(
     return variants[0][2]
 
 
-def _temporary_target(destination: str) -> Path:
+def temporary_download_path(destination: str) -> Path:
     target = Path(destination)
     suffix = target.suffix or ".mp4"
     return target.with_name(f"{target.stem}.part{suffix}")
+
+
+def _temporary_target(destination: str) -> Path:
+    return temporary_download_path(destination)
 
 
 def _validate_download(path: Path, content_type: str = "") -> None:
