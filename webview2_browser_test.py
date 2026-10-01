@@ -96,6 +96,48 @@ def install_native_navigation_guard(
         print(f"[GUARD] no se pudo instalar: {exc}")
 
 
+def install_native_new_window_handler(
+    window: webview.Window,
+    state: dict[str, object],
+) -> None:
+    try:
+        native_webview = window.native.webview
+    except Exception as exc:
+        print(f"[POPUP] WebView2 nativo no disponible: {exc}")
+        return
+
+    if state.get("popup_handler_installed"):
+        return
+
+    def on_new_window_requested(sender, args) -> None:
+        try:
+            uri = str(args.Uri or "")
+        except Exception:
+            uri = ""
+
+        if uri:
+            print("[POPUP-HANDLED]", uri)
+
+        # Mark the request as handled so WebView2 does not replace the current
+        # document or send the target to an external browser. We deliberately
+        # keep the main player page alive.
+        try:
+            args.Handled = True
+        except Exception:
+            try:
+                args.set_Handled(True)
+            except Exception as exc:
+                print(f"[POPUP] no se pudo marcar como atendido: {exc}")
+
+    try:
+        native_webview.NewWindowRequested += on_new_window_requested
+        state["popup_handler_installed"] = True
+        state["popup_handler"] = on_new_window_requested
+        print("[POPUP] interceptor nativo NewWindowRequested instalado")
+    except Exception as exc:
+        print(f"[POPUP] no se pudo instalar: {exc}")
+
+
 def host_of(value: str | None) -> str:
     if not value:
         return ""
@@ -309,6 +351,7 @@ def main() -> int:
         "allowed_hosts": {initial_host} if initial_host else set(),
         "handler_installed": False,
         "last_good_url": url,
+        "popup_handler_installed": False,
     }
     def divert_external(uri: str) -> None:
         print("[NAV-BLOCKED]", uri)
@@ -319,15 +362,12 @@ def main() -> int:
             guard_state,
             divert_external,
         )
+        install_native_new_window_handler(window, guard_state)
 
     window.events.before_show += on_before_show
 
-    outer_hosts = {initial_host} if initial_host else set()
-    last_outer_url = url
-    returning_from_ad = False
-
     def on_loaded() -> None:
-        nonlocal first_codec_report, player_depth, monitor_started, last_outer_url, returning_from_ad
+        nonlocal first_codec_report, player_depth, monitor_started
         try:
             current = window.get_current_url()
         except Exception:
@@ -337,27 +377,6 @@ def main() -> int:
             print("[PAGE]", current)
 
         current_host = host_of(current)
-
-        # Before the embedded player has been discovered, let advertising
-        # redirects actually complete, then return through browser history.
-        # This mimics the manual flow and lets the site's ad state/cookies
-        # advance instead of endlessly cancelling and reloading the source.
-        if auto_player and player_depth == 0 and current:
-            if current_host and current_host not in outer_hosts:
-                if not returning_from_ad:
-                    returning_from_ad = True
-                    print("[AD-BACK] publicidad cargada; regresando a:", last_outer_url)
-                    try:
-                        if window.native.webview.CanGoBack:
-                            window.native.webview.GoBack()
-                            return
-                    except Exception:
-                        pass
-                    window.load_url(last_outer_url)
-                    return
-            else:
-                returning_from_ad = False
-                last_outer_url = current
 
         if first_codec_report:
             first_codec_report = False
@@ -423,7 +442,7 @@ def main() -> int:
     print("Abriendo prueba aislada con Microsoft Edge WebView2…")
     print("URL:", url)
     if "--player" in sys.argv[2:]:
-        print("Modo --player: dejará completar la publicidad inicial, volverá automáticamente y bloqueará redirecciones al entrar al player.")
+        print("Modo --player: mantendrá viva la página principal, atenderá popups con NewWindowRequested y bloqueará redirecciones al entrar al player.")
     else:
         print("Se mostrarán los [IFRAME] detectados sin cambiar de página.")
     print("Cierra esta ventana para volver a PowerShell.")
