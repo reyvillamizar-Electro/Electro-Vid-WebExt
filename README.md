@@ -22,6 +22,7 @@ Aplicación de escritorio para detectar, inspeccionar, previsualizar y descargar
 - modo de pantalla completa con salida mediante Escape;
 - descarga de archivos directos;
 - descarga de HLS/DASH mediante FFmpeg cuando la fuente es accesible;
+- cancelación desde la ventana de progreso, deteniendo la transferencia activa y eliminando solo el archivo parcial de ese intento;
 - abrir fuente y copiar URL.
 
 ## Reproductor mpv
@@ -61,7 +62,7 @@ Para MP4, WebM, MOV y M4V accesibles directamente, la aplicación descarga el ar
 
 Para HLS y DASH utiliza FFmpeg con copia de streams cuando es posible.
 
-La disponibilidad de descarga depende de cómo el servidor publique la fuente. La aplicación no intenta eludir DRM, autenticación ni controles de acceso.
+La disponibilidad de descarga depende de cómo el servidor publique la fuente. La ventana de progreso permite cancelar la descarga; al cancelar, se elimina únicamente el archivo temporal asociado a ese intento y no se tocan descargas anteriores. La aplicación no intenta eludir DRM ni controles de acceso.
 
 ## Requisitos
 
