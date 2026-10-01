@@ -941,8 +941,34 @@ class MainWindow(QMainWindow):
         # source family. Direct files keep their full URL identity.
         if kind in {"HLS", "DASH"}:
             host = (parsed.hostname or "").lower()
-            path = parsed.path or "/"
-            return f"{kind}|{host}|{path}"
+            referer_host = (
+                (urlparse(source.referer).hostname or "").lower()
+                if source.referer
+                else ""
+            )
+            quality = (
+                source.quality_hint
+                if source.quality_hint and source.quality_hint != "—"
+                else ""
+            )
+            resolution = (
+                source.resolution_hint
+                if source.resolution_hint and source.resolution_hint != "—"
+                else ""
+            )
+
+            # Signed HLS URLs can rotate both query parameters and path
+            # components. Prefer page/CDN + quality identity over exact URL.
+            if quality or resolution:
+                return (
+                    f"{kind}|{host}|{referer_host}|"
+                    f"{quality}|{resolution}"
+                )
+
+            # Master manifests without quality metadata are grouped by CDN and
+            # page context so a renewed master URL can replace an expired one.
+            origin_class = source.origin.split("·", 1)[0].strip().lower()
+            return f"{kind}|{host}|{referer_host}|{origin_class}"
 
         return f"{kind}|{source.url}"
 
@@ -998,7 +1024,7 @@ class MainWindow(QMainWindow):
             "Actualizando la fuente temporal antes de usarla…"
         )
         self.browser.rescan_dom()
-        QTimer.singleShot(650, self._finish_fresh_source_action)
+        QTimer.singleShot(1400, self._finish_fresh_source_action)
 
     @Slot()
     def _finish_fresh_source_action(self) -> None:
