@@ -187,6 +187,78 @@ def choose_player_iframe(values: list[str]) -> str | None:
     )[0]
 
 
+def attach_recording_download_handler(core, state: dict[str, object]) -> None:
+    if core is None or state.get("download_handler_installed"):
+        return
+
+    def on_download_starting(sender, args) -> None:
+        destination = str(state.get("record_destination") or "")
+        pending = bool(state.get("record_download_pending"))
+        if not pending or not destination:
+            try:
+                args.Cancel = True
+            except Exception:
+                try:
+                    args.set_Cancel(True)
+                except Exception:
+                    pass
+            return
+
+        state["record_download_pending"] = False
+
+        try:
+            args.ResultFilePath = destination
+        except Exception:
+            try:
+                args.set_ResultFilePath(destination)
+            except Exception:
+                pass
+
+        try:
+            args.Handled = True
+        except Exception:
+            try:
+                args.set_Handled(True)
+            except Exception:
+                pass
+
+        operation = getattr(args, "DownloadOperation", None)
+        if operation is None:
+            emit("recording_saved", path=destination)
+            return
+
+        def on_state_changed(op, event_args) -> None:
+            try:
+                state_name = str(op.State).split(".")[-1].lower()
+            except Exception:
+                state_name = ""
+
+            if "completed" in state_name:
+                emit("recording_saved", path=destination)
+            elif "interrupted" in state_name:
+                emit(
+                    "recording_error",
+                    message="WebView2 interrumpió el guardado de la grabación.",
+                )
+
+        try:
+            operation.StateChanged += on_state_changed
+            state["record_download_operation"] = operation
+            state["record_download_state_handler"] = on_state_changed
+        except Exception:
+            emit("recording_saved", path=destination)
+
+    try:
+        core.DownloadStarting += on_download_starting
+        state["download_handler_installed"] = True
+        state["download_handler"] = on_download_starting
+    except Exception as exc:
+        emit(
+            "diagnostic",
+            message=f"No se pudo instalar DownloadStarting: {exc}",
+        )
+
+
 def attach_popup_handler(core, state: dict[str, object]) -> None:
     if core is None or state.get("popup_handler_installed"):
         return
@@ -237,6 +309,7 @@ def install_popup_handler(window: webview.Window, state: dict[str, object]) -> N
 
     if core is not None:
         attach_popup_handler(core, state)
+        attach_recording_download_handler(core, state)
         return
 
     if state.get("popup_init_handler_installed"):
@@ -252,6 +325,7 @@ def install_popup_handler(window: webview.Window, state: dict[str, object]) -> N
             emit("diagnostic", message=f"No se pudo obtener CoreWebView2: {exc}")
             return
         attach_popup_handler(initialized_core, state)
+        attach_recording_download_handler(initialized_core, state)
 
     try:
         control.CoreWebView2InitializationCompleted += on_initialized
@@ -344,6 +418,9 @@ def main() -> int:
         "popup_handler_installed": False,
         "popup_init_handler_installed": False,
         "navigation_handler_installed": False,
+        "download_handler_installed": False,
+        "record_destination": "",
+        "record_download_pending": False,
     }
 
     window = webview.create_window(
@@ -463,7 +540,7 @@ def main() -> int:
     window.events.request_sent += on_request
 
     webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = False
-    webview.settings["ALLOW_DOWNLOADS"] = False
+    webview.settings["ALLOW_DOWNLOADS"] = True
     webview.settings["IGNORE_SSL_ERRORS"] = False
 
     def command_loop() -> None:
@@ -493,6 +570,182 @@ def main() -> int:
                     for frame in frames:
                         emit("iframe", url=frame, from_url=current)
                     emit_media_snapshot(window, state)
+                elif action == "start_recording":
+                    destination = str(command.get("destination") or "")
+                    silent = bool(command.get("silent", True))
+                    if not destination:
+                        emit("recording_error", message="No se indicó destino para la grabación.")
+                        continue
+
+                    state["record_destination"] = destination
+                    state["record_download_pending"] = False
+
+                    script = """
+                    (() => {
+                      if (window.__ELECTRO_REC && window.__ELECTRO_REC.active) {
+                        return JSON.stringify({ok:false,error:'Ya hay una grabación activa.'});
+                      }
+
+                      const videos = Array.from(document.querySelectorAll('video'));
+                      if (!videos.length) {
+                        return JSON.stringify({ok:false,error:'No se encontró un elemento <video> en el reproductor.'});
+                      }
+
+                      const video = videos
+                        .slice()
+                        .sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight))[0];
+
+                      if (typeof video.captureStream !== 'function') {
+                        return JSON.stringify({ok:false,error:'Este reproductor no expone captureStream().'});
+                      }
+
+                      let stream;
+                      try {
+                        stream = video.captureStream();
+                      } catch (error) {
+                        return JSON.stringify({ok:false,error:'captureStream falló: ' + String(error)});
+                      }
+
+                      const videoTracks = stream.getVideoTracks();
+                      const audioTracks = stream.getAudioTracks();
+                      if (!videoTracks.length) {
+                        return JSON.stringify({ok:false,error:'El reproductor no expuso una pista de video capturable.'});
+                      }
+
+                      const candidates = [
+                        'video/webm;codecs=vp9,opus',
+                        'video/webm;codecs=vp8,opus',
+                        'video/webm'
+                      ];
+                      const mimeType = candidates.find(type => MediaRecorder.isTypeSupported(type)) || '';
+
+                      let recorder;
+                      try {
+                        recorder = mimeType
+                          ? new MediaRecorder(stream, {mimeType})
+                          : new MediaRecorder(stream);
+                      } catch (error) {
+                        return JSON.stringify({ok:false,error:'MediaRecorder no pudo iniciarse: ' + String(error)});
+                      }
+
+                      const chunks = [];
+                      const previousMuted = video.muted;
+
+                      recorder.ondataavailable = event => {
+                        if (event.data && event.data.size > 0) chunks.push(event.data);
+                      };
+
+                      recorder.onerror = event => {
+                        console.error('[Electro Recorder]', event.error || event);
+                      };
+
+                      recorder.onstop = () => {
+                        try {
+                          video.muted = previousMuted;
+                        } catch (_) {}
+
+                        const blob = new Blob(chunks, {
+                          type: recorder.mimeType || 'video/webm'
+                        });
+                        const blobUrl = URL.createObjectURL(blob);
+                        const link = document.createElement('a');
+                        link.href = blobUrl;
+                        link.download = 'electro-recording.webm';
+                        link.style.display = 'none';
+                        document.documentElement.appendChild(link);
+                        link.click();
+                        setTimeout(() => {
+                          URL.revokeObjectURL(blobUrl);
+                          link.remove();
+                        }, 30000);
+                      };
+
+                      window.__ELECTRO_REC = {
+                        active: true,
+                        recorder,
+                        stream,
+                        video,
+                        previousMuted,
+                        silent: __SILENT__
+                      };
+
+                      recorder.start(1000);
+
+                      if (__SILENT__) {
+                        video.muted = true;
+                      }
+
+                      return JSON.stringify({
+                        ok:true,
+                        mimeType:recorder.mimeType || 'video/webm',
+                        videoTracks:videoTracks.length,
+                        audioTracks:audioTracks.length,
+                        silent:__SILENT__
+                      });
+                    })();
+                    """.replaceAll("__SILENT__", silent ? "true" : "false");
+
+                    raw_result = window.evaluate_js(script)
+                    if isinstance(raw_result, str):
+                        try:
+                            result = json.loads(raw_result)
+                        except json.JSONDecodeError:
+                            result = {"ok": False, "error": raw_result}
+                    elif isinstance(raw_result, dict):
+                        result = raw_result
+                    else:
+                        result = {"ok": False, "error": "Respuesta inválida del navegador."}
+
+                    if result.get("ok"):
+                        emit(
+                            "recording_started",
+                            destination=destination,
+                            mime_type=str(result.get("mimeType") or "video/webm"),
+                            video_tracks=int(result.get("videoTracks") or 0),
+                            audio_tracks=int(result.get("audioTracks") or 0),
+                            silent=bool(result.get("silent")),
+                        )
+                    else:
+                        emit(
+                            "recording_error",
+                            message=str(result.get("error") or "No se pudo iniciar la grabación."),
+                        )
+                elif action == "stop_recording":
+                    state["record_download_pending"] = True
+                    script = """
+                    (() => {
+                      const rec = window.__ELECTRO_REC;
+                      if (!rec || !rec.active || !rec.recorder) {
+                        return JSON.stringify({ok:false,error:'No hay una grabación activa.'});
+                      }
+                      rec.active = false;
+                      try {
+                        rec.recorder.stop();
+                      } catch (error) {
+                        return JSON.stringify({ok:false,error:String(error)});
+                      }
+                      return JSON.stringify({ok:true});
+                    })();
+                    """
+                    raw_result = window.evaluate_js(script)
+                    if isinstance(raw_result, str):
+                        try:
+                            result = json.loads(raw_result)
+                        except json.JSONDecodeError:
+                            result = {"ok": False, "error": raw_result}
+                    elif isinstance(raw_result, dict):
+                        result = raw_result
+                    else:
+                        result = {"ok": False, "error": "Respuesta inválida del navegador."}
+
+                    if result.get("ok"):
+                        emit("recording_stopping")
+                    else:
+                        state["record_download_pending"] = False
+                        emit(
+                            "recording_error",
+                            message=str(result.get("error") or "No se pudo detener la grabación."),
+                        )
                 elif action == "close":
                     window.destroy()
                     return
