@@ -431,8 +431,8 @@ class MainWindow(QMainWindow):
         self.download_button.setProperty("role", "success")
         self.record_button = QPushButton("● Grabar reproducción")
         self.record_button.setToolTip(
-            "Captura en video la ventana WebView2 que está reproduciendo. "
-            "Primera prueba: video de la ventana, sin audio del sistema."
+            "Inicia la captura, intenta seleccionar la mayor calidad disponible "
+            "y envía Play automáticamente al reproductor WebView2."
         )
         self.open_folder_button = QPushButton("📁 Abrir carpeta")
         self.open_folder_button.setEnabled(False)
@@ -585,6 +585,7 @@ class MainWindow(QMainWindow):
         self.browser.media_found.connect(self._dynamic_media_found)
         self.browser.navigation_event.connect(self._browser_navigation_event)
         self.browser.embedded_page_found.connect(self._embedded_page_found)
+        self.browser.player_control_event.connect(self._player_control_result)
 
         self.navigation_table = QTableWidget(0, 4)
         self.navigation_table.setHorizontalHeaderLabels(
@@ -1729,9 +1730,37 @@ class MainWindow(QMainWindow):
         self.record_button.setEnabled(True)
         self.record_button.setText("■ Detener grabación")
         self.status_label.setText(
-            "Grabando ventana WebView2. Mantén el reproductor visible; "
-            "pulsa Detener grabación cuando quieras terminar."
+            "Grabación iniciada; configurando calidad máxima y enviando Play…"
         )
+        QTimer.singleShot(350, self.browser.prepare_recording_playback)
+
+    @Slot(object)
+    def _player_control_result(self, event: object) -> None:
+        if not isinstance(event, dict):
+            return
+
+        played = bool(event.get("played"))
+        quality = str(event.get("quality") or "").strip()
+        backend = str(event.get("backend") or "").strip()
+        detail = str(event.get("detail") or "").strip()
+
+        parts: list[str] = []
+        if quality:
+            parts.append(f"calidad {quality}")
+        if backend:
+            parts.append(backend)
+
+        if played:
+            suffix = f" ({', '.join(parts)})" if parts else ""
+            self.status_label.setText(
+                "Grabando: reproducción iniciada automáticamente"
+                f"{suffix}. Pulsa Detener grabación cuando quieras terminar."
+            )
+        else:
+            self.status_label.setText(
+                "La grabación empezó, pero no pude iniciar Play automáticamente. "
+                + (detail or "Pulsa Play manualmente en WebView2.")
+            )
 
     @Slot()
     def _recording_read_stderr(self) -> None:
