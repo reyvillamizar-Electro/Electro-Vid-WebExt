@@ -37,6 +37,7 @@ class VideoSource:
     backend: str = "generic"
     extractor_key: str | None = None
     format_id: str | None = None
+    format_selector: str | None = None
     webpage_url: str | None = None
     title: str | None = None
     audio_url: str | None = None
