@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 from PySide6.QtCore import QUrl, Signal
 from PySide6.QtWebEngineCore import (
+    QWebEnginePage,
     QWebEngineProfile,
     QWebEngineUrlRequestInfo,
     QWebEngineUrlRequestInterceptor,
@@ -72,6 +73,19 @@ class MediaRequestInterceptor(QWebEngineUrlRequestInterceptor):
         )
 
 
+class QuietWebEnginePage(QWebEnginePage):
+    def javaScriptConsoleMessage(
+        self,
+        level,
+        message: str,
+        line_number: int,
+        source_id: str,
+    ) -> None:
+        # Suppress console noise produced by third-party pages. The extractor
+        # surfaces its own failures through the application status/UI instead.
+        return
+
+
 class BrowserView(QWebEngineView):
     media_found = Signal(object)
     page_ready = Signal()
@@ -81,6 +95,7 @@ class BrowserView(QWebEngineView):
 
         self._cookies: dict[tuple[str, str, str], _CookieRecord] = {}
         self.profile = QWebEngineProfile.defaultProfile()
+        self.setPage(QuietWebEnginePage(self.profile, self))
 
         self.interceptor = MediaRequestInterceptor(self)
         self.interceptor.media_found.connect(self._on_network_media)
