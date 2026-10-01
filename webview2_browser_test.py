@@ -32,6 +32,7 @@ def log_request(request) -> None:
 def install_native_navigation_guard(
     window: webview.Window,
     state: dict[str, object],
+    divert_external,
 ) -> None:
     try:
         native_webview = window.native.webview
@@ -81,6 +82,10 @@ def install_native_navigation_guard(
                 return
 
         print("[NAV-CANCEL]", uri)
+        try:
+            divert_external(uri)
+        except Exception as exc:
+            print(f"[AD-SINK] no se pudo desviar la navegación: {exc}")
 
     try:
         native_webview.NavigationStarting += on_navigation_starting
@@ -298,14 +303,61 @@ def main() -> int:
     visited_players: set[str] = set()
     player_depth = 0
     monitor_started = False
+    initial_host = host_of(url)
     guard_state: dict[str, object] = {
-        "enabled": False,
-        "allowed_hosts": set(),
+        "enabled": True,
+        "allowed_hosts": {initial_host} if initial_host else set(),
         "handler_installed": False,
     }
+    ad_lock = threading.Lock()
+    ad_window: webview.Window | None = None
+
+    def close_ad_window_later(target: webview.Window, delay: float = 1.2) -> None:
+        def worker() -> None:
+            time.sleep(delay)
+            try:
+                target.destroy()
+                print("[AD-SINK] ventana publicitaria cerrada")
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=worker,
+            name="webview2-ad-sink-close",
+            daemon=True,
+        ).start()
+
+    def divert_external(uri: str) -> None:
+        nonlocal ad_window
+        with ad_lock:
+            try:
+                if ad_window is not None:
+                    ad_window.destroy()
+            except Exception:
+                pass
+
+            print("[AD-SINK]", uri)
+            ad_window = webview.create_window(
+                "Electro Ad Sink",
+                url=uri,
+                width=2,
+                height=2,
+                x=-10000,
+                y=-10000,
+                hidden=True,
+                focus=False,
+                resizable=False,
+                text_select=False,
+                confirm_close=False,
+            )
+            close_ad_window_later(ad_window)
 
     def on_before_show() -> None:
-        install_native_navigation_guard(window, guard_state)
+        install_native_navigation_guard(
+            window,
+            guard_state,
+            divert_external,
+        )
 
     window.events.before_show += on_before_show
 
@@ -344,15 +396,13 @@ def main() -> int:
                 if player_host:
                     allowed_hosts.add(player_host)
 
-                # From the first embedded player onward, keep top-level
-                # navigation inside the known player chain. Subresources such
-                # as HLS segments are unaffected by NavigationStarting.
-                if player_depth >= 1:
-                    guard_state["enabled"] = True
-                    print(
-                        "[GUARD] navegación externa bloqueada; hosts permitidos:",
-                        ", ".join(sorted(allowed_hosts)),
-                    )
+                # The guard is active from startup. Add each discovered player
+                # host before navigating to it so only the legitimate player
+                # chain stays in the main WebView.
+                print(
+                    "[GUARD] hosts permitidos:",
+                    ", ".join(sorted(allowed_hosts)),
+                )
 
                 visited_players.add(player)
                 player_depth += 1
@@ -365,7 +415,6 @@ def main() -> int:
             allowed_hosts = guard_state.get("allowed_hosts")
             if isinstance(allowed_hosts, set) and current_host:
                 allowed_hosts.add(current_host)
-            guard_state["enabled"] = True
 
     window.events.loaded += on_loaded
     window.events.request_sent += log_request
@@ -379,7 +428,7 @@ def main() -> int:
     print("Abriendo prueba aislada con Microsoft Edge WebView2…")
     print("URL:", url)
     if "--player" in sys.argv[2:]:
-        print("Modo --player: seguirá los iframes y bloqueará redirecciones externas a nivel nativo.")
+        print("Modo --player: mantendrá el player en la ventana principal y desviará publicidad a una WebView oculta.")
     else:
         print("Se mostrarán los [IFRAME] detectados sin cambiar de página.")
     print("Cierra esta ventana para volver a PowerShell.")
