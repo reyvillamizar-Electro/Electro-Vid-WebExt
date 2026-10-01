@@ -74,6 +74,36 @@ class MediaRequestInterceptor(QWebEngineUrlRequestInterceptor):
 
 
 class QuietWebEnginePage(QWebEnginePage):
+    def __init__(self, profile: QWebEngineProfile, parent=None) -> None:
+        super().__init__(profile, parent)
+
+        # The embedded browser is an extractor, not a personal browser.
+        # Deny sensitive browser permissions and cancel WebAuth/passkey flows.
+        self.permissionRequested.connect(self._deny_permission)
+        self.webAuthUxRequested.connect(self._cancel_webauth)
+
+    @staticmethod
+    def _deny_permission(permission) -> None:
+        try:
+            permission.deny()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _cancel_webauth(request) -> None:
+        try:
+            request.cancel()
+        except Exception:
+            pass
+
+    def chooseFiles(self, mode, old_files, accepted_mime_types):
+        # Do not allow web pages to open local file pickers from extractor mode.
+        return []
+
+    def createWindow(self, window_type):
+        # Block popup windows. They are not required for media extraction.
+        return None
+
     def javaScriptConsoleMessage(
         self,
         level,
@@ -94,7 +124,14 @@ class BrowserView(QWebEngineView):
         super().__init__(parent)
 
         self._cookies: dict[tuple[str, str, str], _CookieRecord] = {}
-        self.profile = QWebEngineProfile.defaultProfile()
+
+        # A profile without a storage name is off-the-record: cookies/cache and
+        # permissions are kept only for the lifetime of this BrowserView.
+        self.profile = QWebEngineProfile(self)
+        self.profile.setPersistentCookiesPolicy(
+            QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies
+        )
+        self.profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
         self.setPage(QuietWebEnginePage(self.profile, self))
 
         self.interceptor = MediaRequestInterceptor(self)
@@ -104,7 +141,6 @@ class BrowserView(QWebEngineView):
         cookie_store = self.profile.cookieStore()
         cookie_store.cookieAdded.connect(self._cookie_added)
         cookie_store.cookieRemoved.connect(self._cookie_removed)
-        cookie_store.loadAllCookies()
 
         self.loadFinished.connect(self._on_load_finished)
 
