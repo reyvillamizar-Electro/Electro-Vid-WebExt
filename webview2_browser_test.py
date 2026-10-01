@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
 import webview
 
 
@@ -23,6 +25,78 @@ def log_request(request) -> None:
     lower = url.lower()
     if any(marker in lower for marker in MEDIA_MARKERS):
         print("[MEDIA]", url)
+
+
+def media_snapshot(window: webview.Window) -> list[str]:
+    try:
+        raw = window.evaluate_js(
+            """
+            (() => {
+              const values = new Set();
+              const add = (value) => {
+                if (!value || typeof value !== 'string') return;
+                if (value.startsWith('blob:') || value.startsWith('data:')) return;
+                values.add(value);
+              };
+
+              document.querySelectorAll('video').forEach(video => {
+                add(video.currentSrc);
+                add(video.src);
+              });
+              document.querySelectorAll('source').forEach(source => add(source.src));
+
+              try {
+                performance.getEntriesByType('resource').forEach(entry => {
+                  add(entry.name);
+                });
+              } catch (_) {}
+
+              return JSON.stringify(Array.from(values));
+            })();
+            """
+        )
+        if isinstance(raw, str):
+            values = json.loads(raw)
+        elif isinstance(raw, list):
+            values = raw
+        else:
+            values = []
+    except Exception:
+        return []
+
+    result = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        lower = value.lower()
+        if any(marker in lower for marker in MEDIA_MARKERS):
+            result.append(value)
+    return result
+
+
+def start_media_monitor(window: webview.Window) -> None:
+    def worker() -> None:
+        seen: set[str] = set()
+        while True:
+            try:
+                values = media_snapshot(window)
+            except Exception:
+                values = []
+
+            for value in values:
+                if value in seen:
+                    continue
+                seen.add(value)
+                print("[MEDIA-DOM]", value)
+
+            time.sleep(1.0)
+
+    thread = threading.Thread(
+        target=worker,
+        name="webview2-media-monitor",
+        daemon=True,
+    )
+    thread.start()
 
 
 def iframe_report(window: webview.Window) -> list[str]:
@@ -151,10 +225,12 @@ def main() -> int:
     )
     first_codec_report = True
     auto_player = "--player" in sys.argv[2:]
-    player_opened = False
+    visited_players: set[str] = set()
+    player_depth = 0
+    monitor_started = False
 
     def on_loaded() -> None:
-        nonlocal first_codec_report, player_opened
+        nonlocal first_codec_report, player_depth, monitor_started
         try:
             current = window.get_current_url()
         except Exception:
@@ -167,12 +243,17 @@ def main() -> int:
             first_codec_report = False
             codec_report(window)
 
+        if not monitor_started:
+            monitor_started = True
+            start_media_monitor(window)
+
         frames = iframe_report(window)
-        if auto_player and not player_opened:
+        if auto_player and player_depth < 5:
             player = choose_player_iframe(frames)
-            if player:
-                player_opened = True
-                print("[PLAYER]", player)
+            if player and player not in visited_players:
+                visited_players.add(player)
+                player_depth += 1
+                print(f"[PLAYER {player_depth}]", player)
                 window.load_url(player)
 
     window.events.loaded += on_loaded
@@ -188,7 +269,7 @@ def main() -> int:
     print("Abriendo prueba aislada con Microsoft Edge WebView2…")
     print("URL:", url)
     if "--player" in sys.argv[2:]:
-        print("Modo --player: abrirá automáticamente el iframe que parece ser el reproductor.")
+        print("Modo --player: seguirá automáticamente la cadena de iframes del reproductor.")
     else:
         print("Se mostrarán los [IFRAME] detectados sin cambiar de página.")
     print("Cierra esta ventana para volver a PowerShell.")
