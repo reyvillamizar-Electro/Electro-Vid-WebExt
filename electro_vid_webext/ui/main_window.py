@@ -1201,7 +1201,28 @@ class MainWindow(QMainWindow):
         self._download_worker = None
         self._download_dialog = None
 
-    @Slot()\n    def open_download_folder(self) -> None:\n        if not self._last_download_path:\n            QMessageBox.information(\n                self,\n                "Sin descarga",\n                "Todavía no hay un archivo descargado en esta sesión.",\n            )\n            return\n\n        folder = Path(self._last_download_path).resolve().parent\n        if not folder.exists():\n            QMessageBox.warning(\n                self,\n                "Carpeta no disponible",\n                f"No se encontró la carpeta:\\n{folder}",\n            )\n            return\n\n        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))\n\n    @Slot()
+    @Slot()
+    def open_download_folder(self) -> None:
+        if not self._last_download_path:
+            QMessageBox.information(
+                self,
+                "Sin descarga",
+                "Todavía no hay un archivo descargado en esta sesión.",
+            )
+            return
+
+        folder = Path(self._last_download_path).resolve().parent
+        if not folder.exists():
+            QMessageBox.warning(
+                self,
+                "Carpeta no disponible",
+                f"No se encontró la carpeta:\n{folder}",
+            )
+            return
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    @Slot()
     def open_selected(self) -> None:
         url = self._selected_url()
         if url:
