@@ -66,6 +66,7 @@ class MediaRequestInterceptor(QWebEngineUrlRequestInterceptor):
                 "kind": kind or "Media",
                 "origin": f"Red · {kind or 'Media'}",
                 "referer": referer,
+                "cookie_header": headers.get("cookie"),
                 "origin_header": origin,
             }
         )
@@ -102,6 +103,7 @@ class BrowserView(QWebEngineView):
         origin: str,
         referer: str | None = None,
         origin_header: str | None = None,
+        cookie_header: str | None = None,
     ) -> VideoSource:
         return VideoSource(
             url=url,
@@ -109,7 +111,7 @@ class BrowserView(QWebEngineView):
             origin=origin,
             referer=referer or self.url().toString() or None,
             user_agent=self.profile.httpUserAgent(),
-            cookie_header=self.cookie_header_for(url),
+            cookie_header=cookie_header or self.cookie_header_for(url),
             origin_header=origin_header,
         )
 
@@ -162,6 +164,7 @@ class BrowserView(QWebEngineView):
             origin=str(context.get("origin") or "Red"),
             referer=context.get("referer"),
             origin_header=context.get("origin_header"),
+            cookie_header=context.get("cookie_header"),
         )
         self.media_found.emit(source)
 
