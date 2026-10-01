@@ -9,6 +9,12 @@ from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 ProgressCallback = Callable[[int], None]
+CancelCallback = Callable[[], bool]
+
+
+class DownloadCancelled(RuntimeError):
+    pass
+
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 BAD_CONTENT_TYPES = (
@@ -38,6 +44,7 @@ def download_media(
     user_agent: str | None = None,
     cookie_header: str | None = None,
     origin_header: str | None = None,
+    cancelled: CancelCallback | None = None,
 ) -> None:
     """Download media with browser session context and validate the result."""
     suffix = Path(urlparse(url).path).suffix.lower()
@@ -52,6 +59,7 @@ def download_media(
             user_agent,
             cookie_header,
             origin_header,
+            cancelled,
         )
         return
 
@@ -64,7 +72,10 @@ def download_media(
             user_agent,
             cookie_header,
             origin_header,
+            cancelled,
         )
+    except DownloadCancelled:
+        raise
     except Exception as direct_error:
         try:
             _download_with_ffmpeg(
@@ -75,7 +86,10 @@ def download_media(
                 user_agent,
                 cookie_header,
                 origin_header,
+                cancelled,
             )
+        except DownloadCancelled:
+            raise
         except Exception as ffmpeg_error:
             raise RuntimeError(
                 "La descarga HTTP directa no produjo un video válido y el intento con "
@@ -237,6 +251,7 @@ def _download_direct(
     user_agent: str | None,
     cookie_header: str | None,
     origin_header: str | None,
+    cancelled: CancelCallback | None,
 ) -> None:
     target = Path(destination)
     temp_target = _temporary_target(destination)
@@ -264,6 +279,8 @@ def _download_direct(
             received = 0
             with temp_target.open("wb") as output:
                 while True:
+                    if cancelled and cancelled():
+                        raise DownloadCancelled("Descarga cancelada.")
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
@@ -289,6 +306,7 @@ def _download_with_ffmpeg(
     user_agent: str | None,
     cookie_header: str | None,
     origin_header: str | None,
+    cancelled: CancelCallback | None,
 ) -> None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -349,15 +367,32 @@ def _download_with_ffmpeg(
     )
 
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        if completed.returncode != 0:
-            message = completed.stderr.strip() or "FFmpeg no pudo guardar la fuente."
+
+        while process.poll() is None:
+            if cancelled and cancelled():
+                process.terminate()
+                try:
+                    process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2.0)
+                raise DownloadCancelled("Descarga cancelada.")
+            try:
+                process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass
+
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            message = (stderr or "").strip() or "FFmpeg no pudo guardar la fuente."
             raise RuntimeError(message)
 
         _validate_download(temp_target)
