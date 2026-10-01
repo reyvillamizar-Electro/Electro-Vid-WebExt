@@ -339,6 +339,13 @@ def _sanitize_hls_playlist(
             continue
 
         if line.startswith("#"):
+            # Never remove encryption/key directives. Altering them could turn
+            # an encrypted stream into invalid data and is outside the purpose
+            # of this sanitizer.
+            encryption_tag = line.startswith(
+                ("#EXT-X-KEY:", "#EXT-X-SESSION-KEY:")
+            )
+
             # Rewrite URI="..." attributes to absolute URLs. Reject clearly
             # non-media URI attributes rather than handing them to FFmpeg.
             if 'URI="' in line:
@@ -348,6 +355,11 @@ def _sanitize_hls_playlist(
                     if quote:
                         absolute = urljoin(playlist_url, uri_value)
                         if _suspicious_hls_resource(absolute, playlist_url):
+                            if encryption_tag:
+                                raise RuntimeError(
+                                    "El manifiesto usa una clave/cifrado con una "
+                                    "URI no multimedia; no se modificará."
+                                )
                             removed += 1
                             continue
                         line = prefix + 'URI="' + absolute + '"' + tail
