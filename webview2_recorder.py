@@ -79,34 +79,122 @@ def json_get(url: str) -> Any:
         return json.loads(response.read().decode("utf-8"))
 
 
+VIDEO_PROBE_SCRIPT = r"""
+(() => {
+  const videos = Array.from(document.querySelectorAll('video'));
+  if (!videos.length) {
+    return {
+      count:0,
+      ready:false,
+      playing:false,
+      width:0,
+      height:0,
+      area:0
+    };
+  }
+
+  videos.sort(
+    (a, b) =>
+      (b.videoWidth * b.videoHeight || b.clientWidth * b.clientHeight)
+      - (a.videoWidth * a.videoHeight || a.clientWidth * a.clientHeight)
+  );
+
+  const video = videos[0];
+  const width = Number(video.videoWidth || video.clientWidth || 0);
+  const height = Number(video.videoHeight || video.clientHeight || 0);
+
+  return {
+    count:videos.length,
+    ready:Number(video.readyState || 0) >= 2,
+    playing:!video.paused && !video.ended,
+    width,
+    height,
+    area:width * height
+  };
+})()
+"""
+
+
+def _probe_target(
+    target: dict[str, Any],
+    port: int,
+) -> tuple[int, dict[str, Any]]:
+    ws_url = str(target.get("webSocketDebuggerUrl") or "")
+    if not ws_url:
+        return (-1, {})
+
+    client: CDPClient | None = None
+    try:
+        client = CDPClient(
+            ws_url,
+            f"http://127.0.0.1:{port}",
+        )
+        client.call("Runtime.enable")
+        info = client.evaluate(VIDEO_PROBE_SCRIPT)
+        if not isinstance(info, dict):
+            info = {}
+
+        count = int(info.get("count") or 0)
+        ready = bool(info.get("ready"))
+        playing = bool(info.get("playing"))
+        area = int(info.get("area") or 0)
+
+        # Strongly prefer an actual ready/playing video target. Resolution is
+        # only a tie-breaker; target URL heuristics are deliberately secondary.
+        score = 0
+        if count > 0:
+            score += 1_000_000
+        if ready:
+            score += 2_000_000
+        if playing:
+            score += 4_000_000
+        score += min(area, 3_000_000)
+
+        return (score, info)
+    except Exception:
+        return (-1, {})
+    finally:
+        if client is not None:
+            client.close()
+
+
 def find_target(port: int, timeout: float = 10.0) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     last_error = ""
+    best_target: dict[str, Any] | None = None
+    best_score = -1
+    best_info: dict[str, Any] = {}
 
     while time.monotonic() < deadline:
         try:
             targets = json_get(f"http://127.0.0.1:{port}/json/list")
-            pages = [
+            candidates = [
                 target
                 for target in targets
-                if target.get("type") == "page"
+                if target.get("type") in {"page", "iframe"}
                 and target.get("webSocketDebuggerUrl")
             ]
-            if pages:
-                # The WebView2 app has one top-level page; prefer the currently
-                # visible player URL rather than devtools/internal pages.
-                pages.sort(
-                    key=lambda target: (
-                        str(target.get("url") or "").startswith(("http://", "https://")),
-                        "/v/" in str(target.get("url") or ""),
-                        len(str(target.get("url") or "")),
-                    ),
-                    reverse=True,
-                )
-                return pages[0]
+
+            for target in candidates:
+                score, info = _probe_target(target, port)
+                if score > best_score:
+                    best_score = score
+                    best_target = target
+                    best_info = info
+
+            if best_target is not None and int(best_info.get("count") or 0) > 0:
+                return best_target
+
         except Exception as exc:
             last_error = str(exc)
-        time.sleep(0.25)
+
+        time.sleep(0.35)
+
+    if best_target is not None:
+        raise RuntimeError(
+            "WebView2 respondió, pero ningún target expuso un <video>. "
+            "Deja el reproductor cargado/reproduciendo antes de pulsar Grabar."
+        )
 
     raise RuntimeError(
         "No se pudo conectar con el WebView2 activo."
