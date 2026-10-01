@@ -9,6 +9,59 @@ import webview
 
 DEFAULT_URL = "https://www.google.com"
 
+MEDIA_MARKERS = (
+    ".m3u8",
+    ".mpd",
+    ".mp4",
+    ".webm",
+    ".m4s",
+    ".ts",
+)
+
+
+def install_popup_blocker(window: webview.Window) -> None:
+    try:
+        window.run_js(
+            """
+            (() => {
+              if (window.__ELECTRO_POPUP_BLOCKER__) return;
+              window.__ELECTRO_POPUP_BLOCKER__ = true;
+
+              const originalOpen = window.open;
+              window.open = function(url, ...args) {
+                console.warn('[Electro Test] popup bloqueado:', url || '');
+                return null;
+              };
+
+              document.addEventListener(
+                'click',
+                (event) => {
+                  const target = event.target instanceof Element
+                    ? event.target.closest('a[target="_blank"]')
+                    : null;
+                  if (!target) return;
+                  event.preventDefault();
+                  event.stopImmediatePropagation();
+                  console.warn(
+                    '[Electro Test] enlace target=_blank bloqueado:',
+                    target.href || ''
+                  );
+                },
+                true
+              );
+            })();
+            """
+        )
+    except Exception as exc:
+        print(f"No se pudo instalar el bloqueador de popups: {exc}")
+
+
+def log_request(request) -> None:
+    url = str(getattr(request, "url", "") or "")
+    lower = url.lower()
+    if any(marker in lower for marker in MEDIA_MARKERS):
+        print("[MEDIA]", url)
+
 
 def codec_report(window: webview.Window) -> None:
     try:
@@ -63,7 +116,18 @@ def main() -> int:
         text_select=True,
         confirm_close=False,
     )
-    window.events.loaded += codec_report
+    def on_loaded(current_window: webview.Window) -> None:
+        install_popup_blocker(current_window)
+        codec_report(current_window)
+
+    window.events.loaded += on_loaded
+    window.events.request_sent += log_request
+
+    # pywebview normally sends target=_blank links to the external browser.
+    # Keep them inside the WebView layer so our blocker can suppress them.
+    webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = False
+    webview.settings["ALLOW_DOWNLOADS"] = False
+    webview.settings["IGNORE_SSL_ERRORS"] = False
 
     print("Abriendo prueba aislada con Microsoft Edge WebView2…")
     print("URL:", url)
