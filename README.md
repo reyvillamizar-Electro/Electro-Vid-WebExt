@@ -124,3 +124,8 @@ Electro Vid-WebExt puede usar dos estrategias de extracción:
 Cuando yt-dlp reconoce una plataforma, la aplicación muestra distintas calidades como fuentes seleccionables. Las descargas conservan el `format_id` seleccionado; si el video y el audio vienen separados, yt-dlp y FFmpeg los combinan al guardar.
 
 El backend especializado se integra mediante la API Python de yt-dlp. Algunos sitios pueden cambiar sus mecanismos de reproducción, firmas o tokens, por lo que mantener yt-dlp actualizado ayuda a conservar compatibilidad.
+
+
+### YouTube y runtime JavaScript
+
+El soporte completo actual de YouTube en yt-dlp utiliza `yt-dlp-ejs` y un runtime JavaScript externo. Electro Vid-WebExt instala `yt-dlp[default]`, que incluye EJS, y detecta automáticamente Deno, Node o QuickJS disponibles en el sistema. Deno es el runtime recomendado por yt-dlp. Si no se detecta ninguno, la app puede seguir intentando la extracción, pero YouTube puede ocultar o limitar algunos formatos.
