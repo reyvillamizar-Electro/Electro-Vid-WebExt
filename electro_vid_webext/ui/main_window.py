@@ -11,6 +11,7 @@ from PySide6.QtCore import QObject, QStandardPaths, QThread, QTimer, Qt, QUrl, S
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
@@ -548,6 +549,17 @@ class MainWindow(QMainWindow):
         rescan_button = QPushButton("Detectar ahora")
         self.navigation_toggle_button = QPushButton("Mostrar navegación")
         self.navigation_toggle_button.setCheckable(True)
+
+        self.media_compatibility_check = QCheckBox(
+            "Compatibilidad H.264/AAC (detector)"
+        )
+        self.media_compatibility_check.setChecked(True)
+        self.media_compatibility_check.setToolTip(
+            "Hace que los reproductores web continúen cuando QtWebEngine "
+            "no declara soporte H.264/AAC. La reproducción real sigue a "
+            "cargo de mpv. No modifica DRM ni certificados."
+        )
+
         browser_note = QLabel(
             "Interactúa con la página o inicia el video; las fuentes de red aparecerán en Resultados."
         )
@@ -587,11 +599,15 @@ class MainWindow(QMainWindow):
         reload_button.clicked.connect(self.browser.reload)
         rescan_button.clicked.connect(self.browser.rescan_dom)
         self.navigation_toggle_button.toggled.connect(self._toggle_navigation_panel)
+        self.media_compatibility_check.toggled.connect(
+            self._toggle_media_compatibility
+        )
 
         controls.addWidget(back_button)
         controls.addWidget(reload_button)
         controls.addWidget(rescan_button)
         controls.addWidget(self.navigation_toggle_button)
+        controls.addWidget(self.media_compatibility_check)
         controls.addStretch(1)
 
         self.navigation_panel = QWidget()
@@ -613,6 +629,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(browser_note)
         layout.addWidget(self.browser_splitter, 1)
         return page
+
+    @Slot(bool)
+    def _toggle_media_compatibility(self, enabled: bool) -> None:
+        self.browser.set_media_compatibility(enabled)
+        state = "activada" if enabled else "desactivada"
+        self.status_label.setText(
+            f"Compatibilidad H.264/AAC del detector {state}. "
+            "Recarga la página para una prueba limpia."
+        )
 
     @Slot(bool)
     def _toggle_navigation_panel(self, visible: bool) -> None:
