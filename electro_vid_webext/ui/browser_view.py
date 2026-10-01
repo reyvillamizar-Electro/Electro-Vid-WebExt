@@ -13,6 +13,7 @@ from PySide6.QtWebEngineCore import (
     QWebEngineUrlRequestInterceptor,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWidgets import QApplication
 
 from electro_vid_webext.core.detector import VideoSource, media_kind_from_url
 
@@ -148,7 +149,8 @@ class BrowserView(QWebEngineView):
 
         # A profile without a storage name is off-the-record: cookies/cache and
         # permissions are kept only for the lifetime of this BrowserView.
-        self.profile = QWebEngineProfile(self)
+        app = QApplication.instance()
+        self.profile = QWebEngineProfile(app)
         self.profile.setPersistentCookiesPolicy(
             QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies
         )
@@ -221,6 +223,29 @@ class BrowserView(QWebEngineView):
             """
         )
         self.page().scripts().insert(script)
+
+    def shutdown(self) -> None:
+        """Stop web activity before the main window is destroyed."""
+        try:
+            self.stop()
+        except Exception:
+            pass
+
+        try:
+            self.profile.setUrlRequestInterceptor(None)
+        except Exception:
+            pass
+
+        try:
+            self.setUrl(QUrl("about:blank"))
+        except Exception:
+            pass
+
+        try:
+            page = self.page()
+            page.deleteLater()
+        except Exception:
+            pass
 
     def load_page(self, url: str) -> None:
         self.setUrl(QUrl(url))
