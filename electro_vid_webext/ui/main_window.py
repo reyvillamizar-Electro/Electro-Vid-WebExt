@@ -215,6 +215,8 @@ class MainWindow(QMainWindow):
         self._loop_a: float | None = None
         self._loop_b: float | None = None
         self._fullscreen_preview = False
+        self._closing = False
+        self._browser_shutdown = False
 
         self._build_ui()
 
@@ -1253,8 +1255,69 @@ class MainWindow(QMainWindow):
             return
         super().keyPressEvent(event)
 
-    def closeEvent(self, event: QCloseEvent) -> None:
+    def _active_threads(self) -> list[QThread]:
+        threads = [
+            self._analysis_thread,
+            self._metadata_thread,
+            self._manifest_thread,
+            self._download_thread,
+        ]
+        return [
+            thread
+            for thread in threads
+            if thread is not None and thread.isRunning()
+        ]
+
+    def _begin_shutdown(self) -> None:
+        self._closing = True
+        self.analyze_button.setEnabled(False)
+        self.status_label.setText("Cerrando… esperando tareas activas.")
+
         self._player_timer.stop()
         if self._mpv is not None:
-            self._mpv.close()
+            try:
+                self._mpv.close()
+            except Exception:
+                pass
+
+        if not self._browser_shutdown:
+            self._browser_shutdown = True
+            try:
+                self.browser.shutdown()
+            except Exception:
+                pass
+
+        for thread in self._active_threads():
+            try:
+                thread.requestInterruption()
+            except Exception:
+                pass
+
+    def _check_shutdown_complete(self) -> None:
+        if not self._closing:
+            return
+        if self._active_threads():
+            return
+
+        self.status_label.setText("Cerrando…")
+        QTimer.singleShot(0, self.close)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if not self._closing:
+            self._begin_shutdown()
+
+        active = self._active_threads()
+        if active:
+            for thread in active:
+                try:
+                    thread.finished.connect(
+                        self._check_shutdown_complete,
+                        Qt.ConnectionType.UniqueConnection,
+                    )
+                except (TypeError, RuntimeError):
+                    pass
+            event.ignore()
+            return
+
+        event.accept()
         super().closeEvent(event)
