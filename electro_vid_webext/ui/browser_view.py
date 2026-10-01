@@ -8,6 +8,7 @@ from PySide6.QtCore import QUrl, Signal
 from PySide6.QtWebEngineCore import (
     QWebEnginePage,
     QWebEngineProfile,
+    QWebEngineScript,
     QWebEngineUrlRequestInfo,
     QWebEngineUrlRequestInterceptor,
 )
@@ -156,6 +157,7 @@ class BrowserView(QWebEngineView):
         )
         self.profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
         self.setPage(QuietWebEnginePage(self.profile, self))
+        self._install_credential_blocker()
 
         self.interceptor = MediaRequestInterceptor(self)
         self.interceptor.media_found.connect(self._on_network_media)
@@ -166,6 +168,59 @@ class BrowserView(QWebEngineView):
         cookie_store.cookieRemoved.connect(self._cookie_removed)
 
         self.loadFinished.connect(self._on_load_finished)
+
+    def _install_credential_blocker(self) -> None:
+        script = QWebEngineScript()
+        script.setName("ElectroVidWebExt.DisableCredentialAPIs")
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        script.setRunsOnSubFrames(True)
+        script.setSourceCode(
+            """
+            (() => {
+              const denied = () => Promise.reject(
+                new DOMException(
+                  'Credential and passkey APIs are disabled in extractor mode.',
+                  'NotAllowedError'
+                )
+              );
+
+              try {
+                if (navigator.credentials) {
+                  const proto = Object.getPrototypeOf(navigator.credentials);
+                  if (proto) {
+                    Object.defineProperty(proto, 'get', {
+                      value: denied,
+                      configurable: false,
+                      writable: false
+                    });
+                    Object.defineProperty(proto, 'create', {
+                      value: denied,
+                      configurable: false,
+                      writable: false
+                    });
+                    if ('store' in proto) {
+                      Object.defineProperty(proto, 'store', {
+                        value: denied,
+                        configurable: false,
+                        writable: false
+                      });
+                    }
+                  }
+                }
+              } catch (_) {}
+
+              try {
+                Object.defineProperty(window, 'PublicKeyCredential', {
+                  value: undefined,
+                  configurable: false,
+                  writable: false
+                });
+              } catch (_) {}
+            })();
+            """
+        )
+        self.page().scripts().insert(script)
 
     def load_page(self, url: str) -> None:
         self.setUrl(QUrl(url))
