@@ -134,3 +134,10 @@ El soporte completo actual de YouTube en yt-dlp utiliza `yt-dlp-ejs` y un runtim
 ### Certificados HTTPS
 
 El navegador integrado rechaza certificados HTTPS inválidos en lugar de ignorarlos. Cuando un recurso o reproductor externo presenta un certificado no confiable o mal formado, la pestaña **Navegador** lo registra en el historial como **SSL bloqueado** con la URL y el motivo disponible. Los mensajes internos repetitivos de Chromium se reducen en la terminal, pero los eventos relevantes siguen visibles dentro de la aplicación.
+
+
+### Compatibilidad H.264/AAC del navegador detector
+
+Algunas builds de QtWebEngine no declaran soporte para H.264/AAC aunque mpv y FFmpeg sí puedan manejar esas fuentes. La pestaña **Navegador** incluye la opción **Compatibilidad H.264/AAC (detector)**, activada por defecto.
+
+Este modo modifica únicamente las comprobaciones JavaScript de compatibilidad multimedia (`canPlayType`, `MediaSource.isTypeSupported` y `mediaCapabilities.decodingInfo`) para que reproductores web puedan continuar hasta solicitar la fuente. QtWebEngine no obtiene capacidad real de decodificación H.264/AAC; la reproducción efectiva sigue a cargo de mpv. El modo no modifica DRM, autenticación ni validación de certificados y puede desactivarse para comparar el comportamiento normal.
