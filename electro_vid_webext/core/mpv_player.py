@@ -172,7 +172,7 @@ class MPVController:
         origin_header: str | None = None,
         audio_url: str | None = None,
     ) -> None:
-        options: dict[str, Any] = {"hls-bitrate": "max"}
+        options: dict[str, str] = {"hls-bitrate": "max"}
 
         if user_agent:
             options["user-agent"] = user_agent
@@ -185,7 +185,10 @@ class MPVController:
         if origin_header:
             header_fields.append(f"Origin: {origin_header}")
         if header_fields:
-            options["http-header-fields"] = header_fields
+            # mpv's loadfile option map requires string values. The previous
+            # list value was accepted by JSON but rejected by mpv as
+            # "invalid parameter".
+            options["http-header-fields"] = ",".join(header_fields)
         if audio_url:
             options["audio-file"] = audio_url
 
