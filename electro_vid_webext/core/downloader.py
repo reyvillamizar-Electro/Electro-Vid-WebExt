@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import queue
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 ProgressCallback = Callable[[int], None]
+ProgressDetailsCallback = Callable[[dict[str, object]], None]
 CancelCallback = Callable[[], bool]
 
 
@@ -40,6 +44,7 @@ def download_media(
     destination: str,
     kind: str,
     progress: ProgressCallback | None = None,
+    progress_details: ProgressDetailsCallback | None = None,
     referer: str | None = None,
     user_agent: str | None = None,
     cookie_header: str | None = None,
@@ -55,6 +60,7 @@ def download_media(
             url,
             destination,
             progress,
+            progress_details,
             referer,
             user_agent,
             cookie_header,
@@ -68,6 +74,7 @@ def download_media(
             url,
             destination,
             progress,
+            progress_details,
             referer,
             user_agent,
             cookie_header,
@@ -82,6 +89,7 @@ def download_media(
                 url,
                 destination,
                 progress,
+                progress_details,
                 referer,
                 user_agent,
                 cookie_header,
@@ -95,6 +103,79 @@ def download_media(
                 "La descarga HTTP directa no produjo un video válido y el intento con "
                 f"FFmpeg también falló.\n\nHTTP: {direct_error}\n\nFFmpeg: {ffmpeg_error}"
             ) from ffmpeg_error
+
+
+def _format_progress_time(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "—"
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _probe_source_duration(
+    url: str,
+    referer: str | None,
+    user_agent: str | None,
+    cookie_header: str | None,
+    origin_header: str | None,
+) -> float | None:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+    ]
+
+    clean_ua = _clean_header_value(user_agent)
+    clean_referer = _clean_header_value(referer)
+    clean_cookie = _clean_header_value(cookie_header)
+    clean_origin = _clean_header_value(origin_header)
+
+    if clean_ua:
+        command.extend(["-user_agent", clean_ua])
+    if clean_referer:
+        command.extend(["-referer", clean_referer])
+
+    headers: list[str] = []
+    if clean_cookie:
+        headers.append(f"Cookie: {clean_cookie}")
+    if clean_origin:
+        headers.append(f"Origin: {clean_origin}")
+    if headers:
+        command.extend(["-headers", "\r\n".join(headers) + "\r\n"])
+
+    command.extend(
+        [
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            url,
+        ]
+    )
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if completed.returncode != 0:
+            return None
+        value = float((completed.stdout or "").strip())
+        return value if value > 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 def _clean_header_value(value: str | None) -> str | None:
@@ -251,6 +332,7 @@ def _download_direct(
     url: str,
     destination: str,
     progress: ProgressCallback | None,
+    progress_details: ProgressDetailsCallback | None,
     referer: str | None,
     user_agent: str | None,
     cookie_header: str | None,
@@ -281,6 +363,7 @@ def _download_direct(
                 raise RuntimeError("El servidor informó Content-Length: 0.")
 
             received = 0
+            started_at = time.monotonic()
             with temp_target.open("wb") as output:
                 while True:
                     if cancelled and cancelled():
@@ -290,8 +373,23 @@ def _download_direct(
                         break
                     output.write(chunk)
                     received += len(chunk)
-                    if progress and total > 0:
-                        progress(min(99, int(received * 100 / total)))
+                    percent = min(99, int(received * 100 / total)) if total > 0 else -1
+                    if progress and percent >= 0:
+                        progress(percent)
+                    if progress_details:
+                        elapsed = max(time.monotonic() - started_at, 0.001)
+                        progress_details(
+                            {
+                                "mode": "http",
+                                "percent": percent,
+                                "bytes": received,
+                                "total_bytes": total or None,
+                                "speed_bps": received / elapsed,
+                                "time_seconds": None,
+                                "duration_seconds": None,
+                                "speed_factor": None,
+                            }
+                        )
 
         _validate_download(temp_target, content_type)
         temp_target.replace(target)
@@ -306,6 +404,7 @@ def _download_with_ffmpeg(
     url: str,
     destination: str,
     progress: ProgressCallback | None,
+    progress_details: ProgressDetailsCallback | None,
     referer: str | None,
     user_agent: str | None,
     cookie_header: str | None,
@@ -321,9 +420,6 @@ def _download_with_ffmpeg(
     target.parent.mkdir(parents=True, exist_ok=True)
     temp_target.unlink(missing_ok=True)
 
-    if progress:
-        progress(-1)
-
     source_url = _select_best_hls_variant(
         url,
         referer,
@@ -332,11 +428,27 @@ def _download_with_ffmpeg(
         origin_header,
     )
 
+    duration = _probe_source_duration(
+        source_url,
+        referer,
+        user_agent,
+        cookie_header,
+        origin_header,
+    )
+
+    if progress:
+        progress(0 if duration else -1)
+
     command = [
         ffmpeg,
         "-hide_banner",
         "-loglevel",
         "error",
+        "-nostats",
+        "-stats_period",
+        "0.5",
+        "-progress",
+        "pipe:1",
         "-y",
         "-user_agent",
         _clean_header_value(user_agent) or USER_AGENT,
@@ -377,10 +489,34 @@ def _download_with_ffmpeg(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            bufsize=1,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
-        while process.poll() is None:
+        progress_queue: queue.Queue[str | None] = queue.Queue()
+
+        def _read_progress() -> None:
+            stream = process.stdout
+            if stream is None:
+                progress_queue.put(None)
+                return
+            try:
+                for raw_line in stream:
+                    progress_queue.put(raw_line.rstrip("\r\n"))
+            finally:
+                progress_queue.put(None)
+
+        reader = threading.Thread(
+            target=_read_progress,
+            name="ffmpeg-progress",
+            daemon=True,
+        )
+        reader.start()
+
+        current: dict[str, str] = {}
+        progress_stream_done = False
+
+        while process.poll() is None or not progress_stream_done:
             if cancelled and cancelled():
                 process.terminate()
                 try:
@@ -389,12 +525,71 @@ def _download_with_ffmpeg(
                     process.kill()
                     process.wait(timeout=2.0)
                 raise DownloadCancelled("Descarga cancelada.")
+
             try:
-                process.wait(timeout=0.2)
-            except subprocess.TimeoutExpired:
+                line = progress_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            if line is None:
+                progress_stream_done = True
+                continue
+
+            key, sep, value = line.partition("=")
+            if not sep:
+                continue
+
+            current[key] = value
+            if key != "progress":
+                continue
+
+            out_time_seconds: float | None = None
+            raw_us = current.get("out_time_us") or current.get("out_time_ms")
+            if raw_us:
+                try:
+                    out_time_seconds = int(raw_us) / 1_000_000
+                except ValueError:
+                    pass
+
+            total_size: int | None = None
+            try:
+                total_size = int(current.get("total_size", ""))
+            except ValueError:
                 pass
 
-        stdout, stderr = process.communicate()
+            speed_factor: float | None = None
+            speed_text = current.get("speed", "").rstrip("x")
+            try:
+                speed_factor = float(speed_text)
+            except ValueError:
+                pass
+
+            percent = -1
+            if duration and out_time_seconds is not None:
+                percent = max(
+                    0,
+                    min(99, int(out_time_seconds * 100 / duration)),
+                )
+                if progress:
+                    progress(percent)
+
+            if progress_details:
+                progress_details(
+                    {
+                        "mode": "ffmpeg",
+                        "percent": percent,
+                        "bytes": total_size,
+                        "total_bytes": None,
+                        "speed_bps": None,
+                        "time_seconds": out_time_seconds,
+                        "duration_seconds": duration,
+                        "speed_factor": speed_factor,
+                    }
+                )
+
+            current = {}
+
+        _, stderr = process.communicate()
         if process.returncode != 0:
             message = (stderr or "").strip() or "FFmpeg no pudo guardar la fuente."
             raise RuntimeError(message)
