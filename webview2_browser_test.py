@@ -109,6 +109,16 @@ def install_native_new_window_handler(
     if state.get("popup_handler_installed"):
         return
 
+    try:
+        core = native_webview.CoreWebView2
+    except Exception as exc:
+        print(f"[POPUP] CoreWebView2 no disponible todavía: {exc}")
+        return
+
+    if core is None:
+        print("[POPUP] CoreWebView2 todavía no está inicializado")
+        return
+
     def on_new_window_requested(sender, args) -> None:
         try:
             uri = str(args.Uri or "")
@@ -118,9 +128,9 @@ def install_native_new_window_handler(
         if uri:
             print("[POPUP-HANDLED]", uri)
 
-        # Mark the request as handled so WebView2 does not replace the current
-        # document or send the target to an external browser. We deliberately
-        # keep the main player page alive.
+        # NewWindowRequested belongs to CoreWebView2. Marking Handled keeps
+        # the current document alive and prevents WebView2 from creating or
+        # forwarding the popup.
         try:
             args.Handled = True
         except Exception:
@@ -130,12 +140,13 @@ def install_native_new_window_handler(
                 print(f"[POPUP] no se pudo marcar como atendido: {exc}")
 
     try:
-        native_webview.NewWindowRequested += on_new_window_requested
+        core.NewWindowRequested += on_new_window_requested
         state["popup_handler_installed"] = True
         state["popup_handler"] = on_new_window_requested
-        print("[POPUP] interceptor nativo NewWindowRequested instalado")
+        state["popup_core"] = core
+        print("[POPUP] interceptor CoreWebView2.NewWindowRequested instalado")
     except Exception as exc:
-        print(f"[POPUP] no se pudo instalar: {exc}")
+        print(f"[POPUP] no se pudo instalar en CoreWebView2: {exc}")
 
 
 def host_of(value: str | None) -> str:
@@ -375,6 +386,9 @@ def main() -> int:
 
         if current:
             print("[PAGE]", current)
+
+        if not guard_state.get("popup_handler_installed"):
+            install_native_new_window_handler(window, guard_state)
 
         current_host = host_of(current)
 
