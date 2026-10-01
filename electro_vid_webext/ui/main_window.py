@@ -433,7 +433,16 @@ class MainWindow(QMainWindow):
         self.record_button = QPushButton("● Grabar reproducción")
         self.record_button.setToolTip(
             "Graba directamente el video actual de WebView2. "
-            "Configura calidad, posición y Play manualmente antes de grabar."
+            "1× conserva tiempo normal; 2× reproduce/graba al doble y "
+            "genera al final un MKV normalizado a velocidad normal."
+        )
+        self.record_speed_combo = QComboBox()
+        self.record_speed_combo.addItem("1× normal", 1.0)
+        self.record_speed_combo.addItem("2× rápido", 2.0)
+        self.record_speed_combo.setCurrentIndex(1)
+        self.record_speed_combo.setToolTip(
+            "2× reduce aproximadamente a la mitad el tiempo de captura. "
+            "Al detener, FFmpeg normaliza el MKV final a velocidad normal."
         )
         self.open_folder_button = QPushButton("📁 Abrir carpeta")
         self.open_folder_button.setEnabled(False)
@@ -448,6 +457,7 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.preview_button)
         actions.addWidget(self.download_button)
         actions.addWidget(self.record_button)
+        actions.addWidget(self.record_speed_combo)
         actions.addWidget(self.open_folder_button)
         actions.addWidget(self.open_button)
         actions.addWidget(self.copy_button)
@@ -1657,18 +1667,18 @@ class MainWindow(QMainWindow):
         )
         initial = str(
             Path(downloads or str(Path.home()))
-            / "grabacion-webview2.webm"
+            / "grabacion-webview2.mkv"
         )
         destination, _ = QFileDialog.getSaveFileName(
             self,
             "Guardar grabación del reproductor",
             initial,
-            "Video WebM (*.webm)",
+            "Video Matroska (*.mkv)",
         )
         if not destination:
             return
-        if not destination.lower().endswith(".webm"):
-            destination += ".webm"
+        if not destination.lower().endswith(".mkv"):
+            destination += ".mkv"
 
         target = Path(destination)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1694,6 +1704,8 @@ class MainWindow(QMainWindow):
             )
             return
 
+        speed = float(self.record_speed_combo.currentData() or 1.0)
+
         process = QProcess(self)
         process.setProcessChannelMode(
             QProcess.ProcessChannelMode.SeparateChannels
@@ -1707,6 +1719,8 @@ class MainWindow(QMainWindow):
                 "--output",
                 destination,
                 "--silent",
+                "--speed",
+                f"{speed:.1f}",
             ]
         )
         process.readyReadStandardOutput.connect(self._recording_read_stdout)
@@ -1719,7 +1733,7 @@ class MainWindow(QMainWindow):
         self._record_stdout_buffer = ""
         self.record_button.setEnabled(False)
         self.status_label.setText(
-            "Conectando el grabador al video actual de WebView2…"
+            f"Conectando el grabador al video actual de WebView2 · {speed:g}×…"
         )
         process.start()
 
@@ -1763,6 +1777,7 @@ class MainWindow(QMainWindow):
                 paused = bool(event.get("paused"))
                 width = int(event.get("width") or 0)
                 height = int(event.get("height") or 0)
+                speed = float(event.get("speed") or 1.0)
 
                 state = "pausado" if paused else "reproduciendo"
                 audio_text = (
@@ -1776,16 +1791,30 @@ class MainWindow(QMainWindow):
                     else "resolución desconocida"
                 )
                 self.status_label.setText(
-                    f"Grabando el video actual · {state} · "
+                    f"Grabando · {speed:g}× · {state} · "
                     f"{resolution} · {audio_text}. "
-                    "No se cambiará calidad, Play ni posición."
+                    "Al detener se generará un MKV a velocidad normal."
                 )
+            elif event_type == "processing":
+                speed = float(event.get("speed") or 1.0)
+                self.record_button.setEnabled(False)
+                if speed > 1.01:
+                    self.status_label.setText(
+                        "Normalizando grabación 2× → 1× y creando MKV final…"
+                    )
+                else:
+                    self.status_label.setText(
+                        "Creando MKV final sin recomprimir el video…"
+                    )
             elif event_type == "finished":
                 self.status_label.setText(
                     "Grabación terminada; verificando archivo…"
                 )
             elif event_type == "error":
                 message = str(event.get("message") or "Error de grabación.")
+                recovery = str(event.get("recovery_path") or "").strip()
+                if recovery and recovery not in message:
+                    message += f"\n\nCaptura recuperable: {recovery}"
                 self._record_stderr = (
                     self._record_stderr + "\n" + message
                 )[-6000:]
@@ -1847,7 +1876,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Grabación terminada",
-                "Se guardó el video capturado directamente desde WebView2.",
+                "Se guardó el MKV final a velocidad normal. "
+                "En modo 2×, la captura se aceleró y luego se normalizó automáticamente.",
             )
             return
 
