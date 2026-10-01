@@ -1659,6 +1659,10 @@ class MainWindow(QMainWindow):
 
         lines: list[str] = []
 
+        message = details.get("message")
+        if isinstance(message, str) and message:
+            lines.append(message)
+
         if mode == "ffmpeg":
             current_time = self._format_seconds(time_seconds)
             total_time = (
