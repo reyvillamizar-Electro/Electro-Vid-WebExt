@@ -54,6 +54,68 @@ def host_of(value: str | None) -> str:
     return (urlparse(value).hostname or "").lower()
 
 
+def media_report(window: webview.Window) -> list[str]:
+    try:
+        raw = window.evaluate_js(
+            """
+            (() => {
+              const values = new Set();
+              const add = value => {
+                if (!value || typeof value !== 'string') return;
+                if (value.startsWith('blob:') || value.startsWith('data:')) return;
+                values.add(value);
+              };
+
+              document.querySelectorAll('video').forEach(video => {
+                add(video.currentSrc);
+                add(video.src);
+              });
+              document.querySelectorAll('source[src]').forEach(source => add(source.src));
+
+              try {
+                performance.getEntriesByType('resource').forEach(entry => add(entry.name));
+              } catch (_) {}
+
+              return JSON.stringify(Array.from(values));
+            })();
+            """
+        )
+        if isinstance(raw, str):
+            values = json.loads(raw)
+        elif isinstance(raw, list):
+            values = raw
+        else:
+            values = []
+    except Exception:
+        return []
+
+    result: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        lower = value.lower()
+        if kind_from_url(value) or any(marker in lower for marker in MEDIA_MARKERS):
+            result.append(value)
+    return result
+
+
+def emit_media_snapshot(window: webview.Window, state: dict[str, object]) -> None:
+    current = str(state.get("current_url") or "")
+    user_agent = str(state.get("user_agent") or "")
+    for url in media_report(window):
+        kind = kind_from_url(url) or "Media"
+        emit(
+            "media",
+            url=url,
+            kind=kind,
+            origin=f"WebView2 actual · {kind}",
+            referer=current,
+            origin_header=None,
+            cookie_header=None,
+            user_agent=user_agent,
+        )
+
+
 def iframe_report(window: webview.Window) -> list[str]:
     try:
         raw = window.evaluate_js(
@@ -333,6 +395,8 @@ def main() -> int:
                 from_url=current,
             )
 
+        emit_media_snapshot(window, state)
+
         if not auto_player:
             return
 
@@ -428,6 +492,7 @@ def main() -> int:
                     current = str(state.get("current_url") or "")
                     for frame in frames:
                         emit("iframe", url=frame, from_url=current)
+                    emit_media_snapshot(window, state)
                 elif action == "close":
                     window.destroy()
                     return
