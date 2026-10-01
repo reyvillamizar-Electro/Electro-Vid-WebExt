@@ -4,6 +4,7 @@ import json
 import queue
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -269,6 +270,121 @@ def _select_best_hls_variant(
 
     variants.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return variants[0][2]
+
+
+def _fetch_hls_text(
+    url: str,
+    referer: str | None,
+    user_agent: str | None,
+    cookie_header: str | None,
+    origin_header: str | None,
+) -> str:
+    request = Request(
+        url,
+        headers=_headers(referer, user_agent, cookie_header, origin_header),
+    )
+    with urlopen(request, timeout=20) as response:
+        return response.read(8 * 1024 * 1024).decode("utf-8", errors="replace")
+
+
+def _suspicious_hls_resource(url: str, playlist_url: str) -> bool:
+    parsed = urlparse(url)
+    suffix = Path(parsed.path).suffix.lower()
+    playlist_host = (urlparse(playlist_url).hostname or "").lower()
+    resource_host = (parsed.hostname or "").lower()
+
+    # Do not broadly reject cross-domain media: CDNs are normal for HLS.
+    # Only reject extensions that are clearly non-media for this workflow.
+    if suffix in {".image", ".html", ".htm"}:
+        return True
+
+    # Data/blob/javascript resources are never valid FFmpeg HLS segments here.
+    if parsed.scheme.lower() in {"data", "blob", "javascript"}:
+        return True
+
+    return False
+
+
+def _sanitize_hls_playlist(
+    playlist_url: str,
+    referer: str | None,
+    user_agent: str | None,
+    cookie_header: str | None,
+    origin_header: str | None,
+) -> tuple[str, int]:
+    text = _fetch_hls_text(
+        playlist_url,
+        referer,
+        user_agent,
+        cookie_header,
+        origin_header,
+    )
+
+    raw_lines = text.splitlines()
+    output: list[str] = []
+    removed = 0
+
+    # Tags immediately before a URI that describe only that URI. If the URI is
+    # removed, these must be removed with it to keep the media playlist valid.
+    uri_scoped_prefixes = (
+        "#EXTINF:",
+        "#EXT-X-BYTERANGE:",
+        "#EXT-X-PROGRAM-DATE-TIME:",
+        "#EXT-X-GAP",
+    )
+
+    for raw_line in raw_lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("#"):
+            # Rewrite URI="..." attributes to absolute URLs. Reject clearly
+            # non-media URI attributes rather than handing them to FFmpeg.
+            if 'URI="' in line:
+                prefix, sep, rest = line.partition('URI="')
+                if sep:
+                    uri_value, quote, tail = rest.partition('"')
+                    if quote:
+                        absolute = urljoin(playlist_url, uri_value)
+                        if _suspicious_hls_resource(absolute, playlist_url):
+                            removed += 1
+                            continue
+                        line = prefix + 'URI="' + absolute + '"' + tail
+            output.append(line)
+            continue
+
+        absolute = urljoin(playlist_url, line)
+        if _suspicious_hls_resource(absolute, playlist_url):
+            removed += 1
+            while output and output[-1].startswith(uri_scoped_prefixes):
+                output.pop()
+            continue
+
+        output.append(absolute)
+
+    if not output or output[0] != "#EXTM3U":
+        raise RuntimeError("El manifiesto HLS saneado no es válido.")
+
+    if removed <= 0:
+        raise RuntimeError(
+            "FFmpeg rechazó el HLS, pero no se encontraron recursos no multimedia seguros de retirar."
+        )
+
+    fd, path = tempfile.mkstemp(
+        prefix="electro-vid-webext-",
+        suffix=".m3u8",
+        text=True,
+    )
+    try:
+        with open(fd, "w", encoding="utf-8", newline="\n", closefd=True) as handle:
+            handle.write("\n".join(output))
+            handle.write("\n")
+    except Exception:
+        Path(path).unlink(missing_ok=True)
+        raise
+
+    return path, removed
 
 
 def temporary_download_path(destination: str) -> Path:
@@ -601,23 +717,51 @@ def _download_with_ffmpeg(
             and hls_source
             and "not in allowed_segment_extensions" in stderr
         ):
-            # FFmpeg 8 tightened HLS segment-extension checks. Some ad-inserted
-            # playlists use an ".image" URL for a segment/resource. Retry only
-            # this narrow case instead of using allowed_segment_extensions=ALL.
-            relaxed = list(command)
-            input_index = relaxed.index("-i")
-            relaxed[input_index:input_index] = [
-                "-allowed_segment_extensions",
-                (
-                    "3gp,aac,avi,ac3,eac3,flac,mkv,m3u8,m4a,m4s,m4v,"
-                    "mpg,mov,mp2,mp3,mp4,mpeg,mpegts,ogg,ogv,oga,ts,"
-                    "vob,vtt,wav,webvtt,cmfv,cmfa,ec3,fmp4,html,image"
-                ),
-                "-extension_picky",
-                "0",
-            ]
-            temp_target.unlink(missing_ok=True)
-            return_code, stderr = _run_ffmpeg(relaxed)
+            sanitized_path: str | None = None
+            try:
+                sanitized_path, removed = _sanitize_hls_playlist(
+                    source_url,
+                    referer,
+                    user_agent,
+                    cookie_header,
+                    origin_header,
+                )
+
+                sanitized = list(command)
+                input_index = sanitized.index("-i")
+                sanitized[input_index + 1] = sanitized_path
+
+                # The local manifest contains absolute HTTPS segment URLs.
+                # Explicitly allow only the protocols required for local HLS +
+                # remote HTTP(S), rather than relaxing extension checks.
+                sanitized[input_index:input_index] = [
+                    "-protocol_whitelist",
+                    "file,http,https,tcp,tls,crypto",
+                ]
+
+                temp_target.unlink(missing_ok=True)
+                if progress_details:
+                    progress_details(
+                        {
+                            "mode": "ffmpeg",
+                            "percent": -1,
+                            "bytes": None,
+                            "total_bytes": None,
+                            "speed_bps": None,
+                            "time_seconds": None,
+                            "duration_seconds": duration,
+                            "speed_factor": None,
+                            "message": (
+                                f"HLS saneado: {removed} recurso(s) "
+                                "no multimedia omitido(s)."
+                            ),
+                        }
+                    )
+
+                return_code, stderr = _run_ffmpeg(sanitized)
+            finally:
+                if sanitized_path:
+                    Path(sanitized_path).unlink(missing_ok=True)
 
         if return_code != 0:
             message = stderr or "FFmpeg no pudo guardar la fuente."
