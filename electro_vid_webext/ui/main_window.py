@@ -1684,6 +1684,8 @@ class MainWindow(QMainWindow):
                 "30",
                 "-i",
                 "title=Electro Vid-WebExt · WebView2",
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                 "-c:v",
                 "libx264",
                 "-preset",
