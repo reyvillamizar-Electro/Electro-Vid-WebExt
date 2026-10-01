@@ -364,9 +364,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_browser_tab(), "Navegador")
 
         self.note_label = QLabel(
-            "FFprobe obtiene duración, resolución y codec. mpv/FFmpeg reutilizan la sesión "
-            "del navegador cuando es posible. Los manifiestos HLS se expanden por calidad y "
-            "el contenido con DRM detectado se marca como no compatible."
+            "WebView2 reproduce H.264/AAC con el motor de Microsoft Edge y devuelve las "
+            "fuentes detectadas a la aplicación. FFprobe obtiene duración, resolución y codec; "
+            "mpv/FFmpeg usan las fuentes encontradas. Los manifiestos HLS se expanden por calidad "
+            "y el contenido con DRM detectado se marca como no compatible."
         )
         self.note_label.setWordWrap(True)
         self.note_label.setObjectName("secondaryLabel")
@@ -553,17 +554,19 @@ class MainWindow(QMainWindow):
         self.navigation_toggle_button.setCheckable(True)
 
         self.media_compatibility_check = QCheckBox(
-            "Compatibilidad H.264/AAC (detector)"
+            "H.264/AAC nativo · Microsoft Edge WebView2"
         )
         self.media_compatibility_check.setChecked(True)
+        self.media_compatibility_check.setEnabled(False)
         self.media_compatibility_check.setToolTip(
-            "Hace que los reproductores web continúen cuando QtWebEngine "
-            "no declara soporte H.264/AAC. La reproducción real sigue a "
-            "cargo de mpv. No modifica DRM ni certificados."
+            "WebView2 usa los codecs multimedia disponibles en Microsoft Edge; "
+            "ya no se utiliza el shim de compatibilidad de QtWebEngine."
         )
 
         browser_note = QLabel(
-            "Interactúa con la página o inicia el video; las fuentes de red aparecerán en Resultados."
+            "El navegador se abre en una ventana WebView2 separada para mantener "
+            "estable la interfaz principal. Interactúa allí con el reproductor; "
+            "las fuentes detectadas aparecerán automáticamente en Resultados."
         )
         browser_note.setWordWrap(True)
 
@@ -601,9 +604,6 @@ class MainWindow(QMainWindow):
         reload_button.clicked.connect(self.browser.reload)
         rescan_button.clicked.connect(self.browser.rescan_dom)
         self.navigation_toggle_button.toggled.connect(self._toggle_navigation_panel)
-        self.media_compatibility_check.toggled.connect(
-            self._toggle_media_compatibility
-        )
 
         controls.addWidget(back_button)
         controls.addWidget(reload_button)
@@ -631,15 +631,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(browser_note)
         layout.addWidget(self.browser_splitter, 1)
         return page
-
-    @Slot(bool)
-    def _toggle_media_compatibility(self, enabled: bool) -> None:
-        self.browser.set_media_compatibility(enabled)
-        state = "activada" if enabled else "desactivada"
-        self.status_label.setText(
-            f"Compatibilidad H.264/AAC del detector {state}. "
-            "Recarga la página para una prueba limpia."
-        )
 
     @Slot(bool)
     def _toggle_navigation_panel(self, visible: bool) -> None:
