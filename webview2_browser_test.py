@@ -31,7 +31,27 @@ def install_popup_blocker(window: webview.Window) -> None:
               const originalOpen = window.open;
               window.open = function(url, ...args) {
                 console.warn('[Electro Test] popup bloqueado:', url || '');
-                return null;
+
+                // Some ad-supported players check whether window.open()
+                // returned an object before unlocking the real player.
+                // Return a harmless decoy instead of null, while never
+                // creating an actual browser window.
+                const decoy = {
+                  closed: false,
+                  opener: window,
+                  location: {
+                    href: String(url || ''),
+                    replace() {},
+                    assign() {}
+                  },
+                  focus() {},
+                  blur() {},
+                  close() { this.closed = true; },
+                  postMessage() {},
+                  addEventListener() {},
+                  removeEventListener() {}
+                };
+                return decoy;
               };
 
               document.addEventListener(
@@ -133,19 +153,21 @@ def main() -> int:
         )
 
     def on_before_load() -> None:
-        current = window.get_current_url()
-        if current and not host_allowed(current):
-            print("[NAV BLOQUEADA]", current)
-            window.load_url(original_url)
-            return
+        # before_load fires before the native WebView window is fully ready.
+        # Do not query get_current_url() here; just install the JS guard.
         install_popup_blocker(window)
 
     def on_loaded() -> None:
-        current = window.get_current_url()
+        try:
+            current = window.get_current_url()
+        except Exception:
+            current = None
+
         if current and not host_allowed(current):
             print("[NAV BLOQUEADA]", current)
             window.load_url(original_url)
             return
+
         install_popup_blocker(window)
         codec_report(window)
 
