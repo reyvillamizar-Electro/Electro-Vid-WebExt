@@ -7,5 +7,6 @@ requires-python = ">=3.14"
 dependencies = [
     "pyside6>=6.11.2",
     "pywebview",
+    "websocket-client>=1.8.0",
     "yt-dlp[default]",
 ]
