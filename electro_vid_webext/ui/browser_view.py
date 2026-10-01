@@ -81,6 +81,7 @@ class QuietWebEnginePage(QWebEnginePage):
         # Deny sensitive browser permissions and cancel WebAuth/passkey flows.
         self.permissionRequested.connect(self._deny_permission)
         self.webAuthUxRequested.connect(self._cancel_webauth)
+        self.fileSystemAccessRequested.connect(self._reject_file_system_access)
 
     @staticmethod
     def _deny_permission(permission) -> None:
@@ -93,6 +94,13 @@ class QuietWebEnginePage(QWebEnginePage):
     def _cancel_webauth(request) -> None:
         try:
             request.cancel()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _reject_file_system_access(request) -> None:
+        try:
+            request.reject()
         except Exception:
             pass
 
@@ -125,11 +133,26 @@ class BrowserView(QWebEngineView):
 
         self._cookies: dict[tuple[str, str, str], _CookieRecord] = {}
 
+        # Clear data from the older versions that used Qt's default profile.
+        # This profile is not used for browsing anymore.
+        legacy_profile = QWebEngineProfile.defaultProfile()
+        try:
+            legacy_profile.cookieStore().deleteAllCookies()
+            legacy_profile.clearHttpCache()
+            legacy_profile.clearAllVisitedLinks()
+            for permission in legacy_profile.listAllPermissions():
+                permission.reset()
+        except Exception:
+            pass
+
         # A profile without a storage name is off-the-record: cookies/cache and
         # permissions are kept only for the lifetime of this BrowserView.
         self.profile = QWebEngineProfile(self)
         self.profile.setPersistentCookiesPolicy(
             QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies
+        )
+        self.profile.setPersistentPermissionsPolicy(
+            QWebEngineProfile.PersistentPermissionsPolicy.StoreInMemory
         )
         self.profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
         self.setPage(QuietWebEnginePage(self.profile, self))
