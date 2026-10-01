@@ -586,7 +586,6 @@ class MainWindow(QMainWindow):
         self.browser.media_found.connect(self._dynamic_media_found)
         self.browser.navigation_event.connect(self._browser_navigation_event)
         self.browser.embedded_page_found.connect(self._embedded_page_found)
-        self.browser.player_control_event.connect(self._player_control_result)
 
         self.navigation_table = QTableWidget(0, 4)
         self.navigation_table.setHorizontalHeaderLabels(
