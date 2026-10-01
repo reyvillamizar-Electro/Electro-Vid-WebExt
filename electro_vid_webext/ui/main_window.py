@@ -46,6 +46,7 @@ from electro_vid_webext.core.specialized import (
     detect_specific_extractor,
     download_specialized,
     extract_specialized_sources,
+    javascript_runtime,
 )
 from electro_vid_webext.ui.browser_view import BrowserView
 
@@ -677,6 +678,13 @@ class MainWindow(QMainWindow):
         if mode == "generic":
             self.extractor_status.setText("Extractor: genérico · navegador/red")
 
+    def _update_analyze_enabled(self) -> None:
+        busy = any(
+            thread is not None and thread.isRunning()
+            for thread in (self._analysis_thread, self._specialized_thread)
+        )
+        self.analyze_button.setEnabled(not busy)
+
     def _start_generic_analysis(self, url: str) -> None:
         self._analysis_thread = QThread(self)
         self._analysis_worker = AnalysisWorker(url)
@@ -713,7 +721,11 @@ class MainWindow(QMainWindow):
     @Slot(object, list)
     def _specialized_finished(self, match: object, sources: list[VideoSource]) -> None:
         extractor_name = getattr(match, "name", None) or getattr(match, "key", None) or "yt-dlp"
-        self.extractor_status.setText(f"Extractor: yt-dlp · {extractor_name}")
+        runtime = javascript_runtime()
+        runtime_text = f" · JS: {runtime[0]}" if runtime else " · JS runtime no detectado"
+        self.extractor_status.setText(
+            f"Extractor: yt-dlp · {extractor_name}{runtime_text}"
+        )
 
         added = 0
         for source in sources:
@@ -728,7 +740,7 @@ class MainWindow(QMainWindow):
                 self.table.selectRow(0)
             self._scan_pending_metadata()
 
-        self.analyze_button.setEnabled(True)
+        self._update_analyze_enabled()
 
     @Slot(str)
     def _specialized_unsupported(self, message: str) -> None:
@@ -738,7 +750,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(message)
         else:
             self.extractor_status.setText("Extractor: genérico · navegador/red")
-        self.analyze_button.setEnabled(True)
+        self._update_analyze_enabled()
 
     @Slot(str)
     def _specialized_failed(self, message: str) -> None:
@@ -754,12 +766,13 @@ class MainWindow(QMainWindow):
             self.status_label.setText(
                 "yt-dlp no pudo completar la extracción; el navegador seguirá buscando."
             )
-        self.analyze_button.setEnabled(True)
+        self._update_analyze_enabled()
 
     @Slot()
     def _cleanup_specialized_thread(self) -> None:
         self._specialized_thread = None
         self._specialized_worker = None
+        self._update_analyze_enabled()
 
     @Slot(list)
     def _analysis_finished(self, sources: list[VideoSource]) -> None:
@@ -779,7 +792,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(
                 "El HTML inicial no mostró fuentes. El navegador seguirá inspeccionando la red."
             )
-            self.analyze_button.setEnabled(True)
+            self._update_analyze_enabled()
 
     def _add_source(self, source: VideoSource) -> bool:
         if not source.url:
@@ -1035,14 +1048,14 @@ class MainWindow(QMainWindow):
     def _metadata_finished(self) -> None:
         self._metadata_thread = None
         self._metadata_worker = None
-        self.analyze_button.setEnabled(True)
+        self._update_analyze_enabled()
         self.status_label.setText(f"{len(self._sources)} fuente(s) de video lista(s).")
         if self._pending_metadata:
             QTimer.singleShot(100, self._scan_pending_metadata)
 
     @Slot(str)
     def _analysis_failed(self, message: str) -> None:
-        self.analyze_button.setEnabled(True)
+        self._update_analyze_enabled()
 
         if self._sources:
             self.status_label.setText(
@@ -1059,6 +1072,7 @@ class MainWindow(QMainWindow):
     def _cleanup_analysis_thread(self) -> None:
         self._analysis_thread = None
         self._analysis_worker = None
+        self._update_analyze_enabled()
 
     def _row_for_url(self, url: str) -> int | None:
         for row in range(self.table.rowCount()):
