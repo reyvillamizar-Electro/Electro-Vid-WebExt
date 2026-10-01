@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -257,6 +259,8 @@ START_SCRIPT = r"""
   }
 
   const previousMuted = video.muted;
+  const previousPlaybackRate = Number(video.playbackRate || 1);
+  const previousPreservesPitch = video.preservesPitch;
   const chunks = [];
 
   recorder.ondataavailable = event => {
@@ -278,6 +282,10 @@ START_SCRIPT = r"""
     }
     try {
       video.muted = previousMuted;
+      video.playbackRate = previousPlaybackRate;
+      if (typeof previousPreservesPitch === 'boolean') {
+        video.preservesPitch = previousPreservesPitch;
+      }
     } catch (_) {}
   };
 
@@ -289,6 +297,8 @@ START_SCRIPT = r"""
     stream,
     video,
     previousMuted,
+    previousPlaybackRate,
+    previousPreservesPitch,
     chunks
   };
 
@@ -305,6 +315,11 @@ START_SCRIPT = r"""
     } catch (_) {}
   }
 
+  try {
+    video.preservesPitch = true;
+    video.playbackRate = __RATE__;
+  } catch (_) {}
+
   return {
     ok:true,
     paused:video.paused,
@@ -314,7 +329,8 @@ START_SCRIPT = r"""
     videoTracks:videoTracks.length,
     audioTracks:audioTracks.length,
     mimeType:recorder.mimeType || 'video/webm',
-    silent:__SILENT__
+    silent:__SILENT__,
+    speed:Number(video.playbackRate || __RATE__)
   };
 })()
 """
@@ -422,6 +438,123 @@ STOP_SCRIPT = r"""
 """
 
 
+def finalize_capture(
+    capture_path: Path,
+    output_path: Path,
+    speed: float,
+    has_audio: bool,
+) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError(
+            "No se encontró FFmpeg para crear el MKV final. "
+            f"La captura temporal quedó en: {capture_path}"
+        )
+
+    emit(
+        "processing",
+        output=str(output_path),
+        speed=speed,
+        has_audio=has_audio,
+    )
+
+    if speed <= 1.01:
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(capture_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c",
+            "copy",
+            str(output_path),
+        ]
+    elif has_audio:
+        # The first input only supplies video with timestamps stretched back
+        # to normal duration. The second input supplies audio, which is
+        # time-stretched to normal duration and re-encoded.
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-itsscale",
+            f"{speed:.6f}",
+            "-i",
+            str(capture_path),
+            "-i",
+            str(capture_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0?",
+            "-c:v",
+            "copy",
+            "-af",
+            f"atempo={1.0 / speed:.6f}",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            str(output_path),
+        ]
+    else:
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-itsscale",
+            f"{speed:.6f}",
+            "-i",
+            str(capture_path),
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            str(output_path),
+        ]
+
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        error = (completed.stderr or "").strip()
+        if len(error) > 1800:
+            error = error[-1800:]
+        raise RuntimeError(
+            "FFmpeg no pudo crear el MKV final."
+            + (f"\n\n{error}" if error else "")
+            + f"\n\nLa captura temporal quedó en: {capture_path}"
+        )
+
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        raise RuntimeError(
+            "FFmpeg terminó sin crear un MKV válido. "
+            f"La captura temporal quedó en: {capture_path}"
+        )
+
+    try:
+        capture_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def command_watcher(stop_event: threading.Event) -> None:
     for line in sys.stdin:
         if line.strip().lower() in {"stop", "q", "quit"}:
@@ -434,11 +567,21 @@ def main() -> int:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--silent", action="store_true")
+    parser.add_argument(
+        "--speed",
+        type=float,
+        choices=(1.0, 2.0),
+        default=1.0,
+    )
     args = parser.parse_args()
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.unlink(missing_ok=True)
+    capture = output.with_name(
+        f"{output.stem}.capture.webm"
+    )
+    capture.unlink(missing_ok=True)
 
     stop_event = threading.Event()
     threading.Thread(
@@ -458,9 +601,13 @@ def main() -> int:
         client = CDPClient(ws_url, origin)
         client.call("Runtime.enable")
 
-        script = START_SCRIPT.replace(
-            "__SILENT__",
-            "true" if args.silent else "false",
+        script = (
+            START_SCRIPT
+            .replace(
+                "__SILENT__",
+                "true" if args.silent else "false",
+            )
+            .replace("__RATE__", f"{args.speed:.6f}")
         )
         started = client.evaluate(script)
         if not isinstance(started, dict) or not started.get("ok"):
@@ -471,7 +618,7 @@ def main() -> int:
             )
             raise RuntimeError(message)
 
-        handle = output.open("wb")
+        handle = capture.open("wb")
 
         # MediaRecorder is already running and START_SCRIPT has already applied
         # local mute when requested. Only now ask the existing player to Play;
@@ -498,6 +645,7 @@ def main() -> int:
         emit(
             "started",
             output=str(output),
+            capture=str(capture),
             target_url=str(target.get("url") or ""),
             paused=not bool(play_result.get("played")),
             played=bool(play_result.get("played")),
@@ -513,6 +661,7 @@ def main() -> int:
             audio_tracks=int(started.get("audioTracks") or 0),
             mime_type=str(started.get("mimeType") or "video/webm"),
             silent=bool(started.get("silent")),
+            speed=float(started.get("speed") or args.speed),
         )
 
         while not stop_event.is_set():
@@ -555,10 +704,23 @@ def main() -> int:
         handle.close()
         handle = None
 
-        if not output.exists() or output.stat().st_size <= 0:
+        if not capture.exists() or capture.stat().st_size <= 0:
             raise RuntimeError("La grabación terminó sin producir datos.")
 
-        emit("finished", output=str(output), size=output.stat().st_size)
+        has_audio = int(started.get("audioTracks") or 0) > 0
+        finalize_capture(
+            capture,
+            output,
+            float(args.speed),
+            has_audio,
+        )
+
+        emit(
+            "finished",
+            output=str(output),
+            size=output.stat().st_size,
+            speed=float(args.speed),
+        )
         return 0
 
     except Exception as exc:
@@ -571,7 +733,15 @@ def main() -> int:
             output.unlink(missing_ok=True)
         except OSError:
             pass
-        emit("error", message=str(exc))
+        emit(
+            "error",
+            message=str(exc),
+            recovery_path=(
+                str(capture)
+                if capture.exists() and capture.stat().st_size > 0
+                else ""
+            ),
+        )
         return 1
     finally:
         if client is not None:
