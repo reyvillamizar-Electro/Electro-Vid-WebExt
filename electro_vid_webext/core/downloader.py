@@ -886,6 +886,13 @@ def _download_with_ffmpeg(
                 origin_header,
             )
 
+            if video_index is None and audio_index is None:
+                raise RuntimeError(
+                    "La fuente HLS no expuso ninguna pista de video/audio válida. "
+                    "La URL probablemente caducó o fue renovada por el reproductor. "
+                    "Activa nuevamente el reproductor y vuelve a intentar la descarga."
+                )
+
             relaxed = list(command)
             input_index = relaxed.index("-i")
             relaxed[input_index:input_index] = [
@@ -988,7 +995,20 @@ def _download_with_ffmpeg(
 
                 return_code, stderr = _run_ffmpeg(capture)
 
-                if return_code == 0 and intermediate_ts.exists():
+                captured_size = (
+                    intermediate_ts.stat().st_size
+                    if intermediate_ts.exists()
+                    else 0
+                )
+
+                if return_code == 0 and captured_size <= 0:
+                    return_code = 1
+                    stderr = (
+                        "La fuente HLS no entregó datos de video. "
+                        "El enlace temporal parece haber caducado o sido renovado."
+                    )
+
+                if return_code == 0 and captured_size > 0:
                     temp_target.unlink(missing_ok=True)
 
                     remux = [
