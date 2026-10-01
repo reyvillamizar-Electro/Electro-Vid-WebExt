@@ -468,6 +468,8 @@ def _download_with_ffmpeg(
     if extra_headers:
         command.extend(["-headers", "\r\n".join(extra_headers) + "\r\n"])
 
+    hls_source = urlparse(source_url).path.lower().endswith((".m3u8", ".m3u"))
+
     command.extend(
         [
             "-i",
@@ -482,9 +484,9 @@ def _download_with_ffmpeg(
         ]
     )
 
-    try:
+    def _run_ffmpeg(command_to_run: list[str]) -> tuple[int, str]:
         process = subprocess.Popen(
-            command,
+            command_to_run,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -590,8 +592,35 @@ def _download_with_ffmpeg(
             current = {}
 
         _, stderr = process.communicate()
-        if process.returncode != 0:
-            message = (stderr or "").strip() or "FFmpeg no pudo guardar la fuente."
+        return process.returncode or 0, (stderr or "").strip()
+
+    try:
+        return_code, stderr = _run_ffmpeg(command)
+        if (
+            return_code != 0
+            and hls_source
+            and "not in allowed_segment_extensions" in stderr
+        ):
+            # FFmpeg 8 tightened HLS segment-extension checks. Some ad-inserted
+            # playlists use an ".image" URL for a segment/resource. Retry only
+            # this narrow case instead of using allowed_segment_extensions=ALL.
+            relaxed = list(command)
+            input_index = relaxed.index("-i")
+            relaxed[input_index:input_index] = [
+                "-allowed_segment_extensions",
+                (
+                    "3gp,aac,avi,ac3,eac3,flac,mkv,m3u8,m4a,m4s,m4v,"
+                    "mpg,mov,mp2,mp3,mp4,mpeg,mpegts,ogg,ogv,oga,ts,"
+                    "vob,vtt,wav,webvtt,cmfv,cmfa,ec3,fmp4,html,image"
+                ),
+                "-extension_picky",
+                "0",
+            ]
+            temp_target.unlink(missing_ok=True)
+            return_code, stderr = _run_ffmpeg(relaxed)
+
+        if return_code != 0:
+            message = stderr or "FFmpeg no pudo guardar la fuente."
             raise RuntimeError(message)
 
         _validate_download(temp_target)
