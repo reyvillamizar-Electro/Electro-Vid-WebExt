@@ -21,6 +21,28 @@ class SpecializedDownloadCancelled(RuntimeError):
     pass
 
 
+def javascript_runtime() -> tuple[str, str] | None:
+    candidates = [
+        ("deno", "deno"),
+        ("node", "node"),
+        ("quickjs", "quickjs"),
+        ("quickjs", "qjs"),
+    ]
+    for name, executable in candidates:
+        path = shutil.which(executable)
+        if path:
+            return name, path
+    return None
+
+
+def _js_runtime_options() -> dict:
+    runtime = javascript_runtime()
+    if runtime is None:
+        return {}
+    name, path = runtime
+    return {"js_runtimes": {name: {"path": path}}}
+
+
 @dataclass(frozen=True, slots=True)
 class ExtractorMatch:
     key: str
@@ -53,6 +75,7 @@ def extract_specialized_sources(url: str) -> tuple[ExtractorMatch, list[VideoSou
         "noplaylist": True,
         "socket_timeout": 20,
     }
+    options.update(_js_runtime_options())
 
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -240,6 +263,7 @@ def download_specialized(
             "socket_timeout": 30,
             "overwrites": True,
         }
+        options.update(_js_runtime_options())
 
         try:
             with YoutubeDL(options) as ydl:
