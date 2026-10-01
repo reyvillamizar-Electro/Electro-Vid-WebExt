@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QUrl, Signal
+from PySide6.QtCore import QTimer, QUrl, Signal
 from PySide6.QtWebEngineCore import (
     QWebEnginePage,
     QWebEngineProfile,
@@ -42,6 +42,7 @@ def _bytes_text(value) -> str:
 class MediaRequestInterceptor(QWebEngineUrlRequestInterceptor):
     media_found = Signal(object)
     navigation_seen = Signal(object)
+    embedded_page_seen = Signal(str)
 
     def interceptRequest(self, info: QWebEngineUrlRequestInfo) -> None:
         url = info.requestUrl().toString()
@@ -63,6 +64,24 @@ class MediaRequestInterceptor(QWebEngineUrlRequestInterceptor):
                     "first_party": info.firstPartyUrl().toString(),
                 }
             )
+
+        try:
+            is_sub_frame = (
+                info.resourceType()
+                == QWebEngineUrlRequestInfo.ResourceType.ResourceTypeSubFrame
+            )
+        except Exception:
+            is_sub_frame = False
+
+        if is_sub_frame:
+            self.navigation_seen.emit(
+                {
+                    "event": "Iframe / subframe",
+                    "url": url,
+                    "first_party": info.firstPartyUrl().toString(),
+                }
+            )
+            self.embedded_page_seen.emit(url)
 
         is_media_resource = (
             info.resourceType() == QWebEngineUrlRequestInfo.ResourceType.ResourceTypeMedia
@@ -147,6 +166,7 @@ class QuietWebEnginePage(QWebEnginePage):
 class BrowserView(QWebEngineView):
     media_found = Signal(object)
     navigation_event = Signal(object)
+    embedded_page_found = Signal(str)
     page_ready = Signal()
 
     def __init__(self, parent=None) -> None:
@@ -155,6 +175,7 @@ class BrowserView(QWebEngineView):
         self._cookies: dict[tuple[str, str, str], _CookieRecord] = {}
         self._initial_url = ""
         self._last_url = ""
+        self._embedded_seen: set[str] = set()
 
         # Clear data from the older versions that used Qt's default profile.
         # This profile is not used for browsing anymore.
@@ -185,6 +206,7 @@ class BrowserView(QWebEngineView):
         self.interceptor = MediaRequestInterceptor(self)
         self.interceptor.media_found.connect(self._on_network_media)
         self.interceptor.navigation_seen.connect(self._on_navigation_seen)
+        self.interceptor.embedded_page_seen.connect(self._on_embedded_page_seen)
         self.profile.setUrlRequestInterceptor(self.interceptor)
 
         page = self.page()
@@ -278,6 +300,7 @@ class BrowserView(QWebEngineView):
     def load_page(self, url: str) -> None:
         self._initial_url = url
         self._last_url = ""
+        self._embedded_seen.clear()
         self.navigation_event.emit(
             {
                 "event": "URL inicial",
@@ -287,6 +310,14 @@ class BrowserView(QWebEngineView):
             }
         )
         self.setUrl(QUrl(url))
+
+    def _on_embedded_page_seen(self, url: str) -> None:
+        if not url or url in self._embedded_seen:
+            return
+        if url.startswith(("about:", "data:", "blob:")):
+            return
+        self._embedded_seen.add(url)
+        self.embedded_page_found.emit(url)
 
     def _on_navigation_seen(self, context: object) -> None:
         if not isinstance(context, dict):
@@ -494,49 +525,86 @@ class BrowserView(QWebEngineView):
         if not ok:
             return
         self.rescan_dom()
+        QTimer.singleShot(1000, self.rescan_dom)
+        QTimer.singleShot(3000, self.rescan_dom)
+        QTimer.singleShot(7000, self.rescan_dom)
         self.page_ready.emit()
 
     def rescan_dom(self) -> None:
         script = """
         (() => {
-          const found = new Set();
-          const add = (value) => {
+          const media = new Set();
+          const iframes = new Set();
+
+          const addMedia = (value) => {
             if (!value || typeof value !== 'string') return;
             if (value.startsWith('blob:') || value.startsWith('data:')) return;
-            found.add(value);
+            media.add(value);
+          };
+
+          const addFrame = (value) => {
+            if (!value || typeof value !== 'string') return;
+            if (value.startsWith('about:') || value.startsWith('data:') || value.startsWith('blob:')) return;
+            try {
+              iframes.add(new URL(value, document.baseURI).href);
+            } catch (_) {}
           };
 
           document.querySelectorAll('video').forEach(video => {
-            add(video.currentSrc);
-            add(video.src);
+            addMedia(video.currentSrc);
+            addMedia(video.src);
           });
-          document.querySelectorAll('source').forEach(source => add(source.src));
+
+          document.querySelectorAll('source').forEach(source => addMedia(source.src));
+          document.querySelectorAll('iframe[src], frame[src]').forEach(frame => addFrame(frame.src));
 
           try {
-            performance.getEntriesByType('resource').forEach(entry => add(entry.name));
+            performance.getEntriesByType('resource').forEach(entry => {
+              addMedia(entry.name);
+              const type = String(entry.initiatorType || '').toLowerCase();
+              if (type === 'iframe' || type === 'frame') addFrame(entry.name);
+            });
           } catch (_) {}
 
-          return Array.from(found);
+          try {
+            const html = document.documentElement ? document.documentElement.innerHTML : '';
+            const re = /https?:\\/\\/[^"'\\s<>]+?\\.(?:mp4|webm|m3u8|mpd|mov|m4v|mkv)(?:\\?[^"'\\s<>]*)?/gi;
+            for (const match of html.matchAll(re)) addMedia(match[0].replace(/&amp;/g, '&'));
+          } catch (_) {}
+
+          return {
+            media: Array.from(media),
+            iframes: Array.from(iframes)
+          };
         })();
         """
         self.page().runJavaScript(script, self._consume_dom_results)
 
     def _consume_dom_results(self, values) -> None:
-        if not isinstance(values, list):
+        if not isinstance(values, dict):
             return
 
-        for value in values:
-            if not isinstance(value, str):
-                continue
-            kind = media_kind_from_url(value)
-            if not kind:
-                continue
+        media_values = values.get("media")
+        if isinstance(media_values, list):
+            for value in media_values:
+                if not isinstance(value, str):
+                    continue
+                kind = media_kind_from_url(value)
+                if not kind:
+                    continue
 
-            self.media_found.emit(
-                self.session_source(
-                    url=value,
-                    kind=kind,
-                    origin=f"DOM/Red · {kind}",
-                    referer=self.url().toString() or None,
+                self.media_found.emit(
+                    self.session_source(
+                        url=value,
+                        kind=kind,
+                        origin=f"DOM/HTML dinámico · {kind}",
+                        referer=self.url().toString() or None,
+                    )
                 )
-            )
+
+        iframe_values = values.get("iframes")
+        if isinstance(iframe_values, list):
+            for value in iframe_values:
+                if not isinstance(value, str):
+                    continue
+                self._on_embedded_page_seen(value)
