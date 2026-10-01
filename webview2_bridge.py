@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
 import threading
+import time
+from pathlib import Path
 from urllib.parse import urlparse
 
 import webview
@@ -321,6 +324,348 @@ def install_navigation_guard(window: webview.Window, state: dict[str, object]) -
         emit("diagnostic", message=f"No se pudo instalar NavigationStarting: {exc}")
 
 
+class BrowserMediaRecorder:
+    def __init__(self, window: webview.Window) -> None:
+        self.window = window
+        self._lock = threading.Lock()
+        self._active = False
+        self._stopping = False
+        self._destination = ""
+        self._handle = None
+        self._worker: threading.Thread | None = None
+
+    def start(self, destination: str, silent: bool = True) -> None:
+        with self._lock:
+            if self._active:
+                emit("recording_error", message="Ya hay una grabación activa.")
+                return
+
+        target = Path(destination)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            handle = target.open("wb")
+        except Exception as exc:
+            emit("recording_error", message=f"No se pudo crear el archivo: {exc}")
+            return
+
+        script = """
+        (() => {
+          if (window.__ELECTRO_REC && window.__ELECTRO_REC.active) {
+            return JSON.stringify({ok:false,error:'Ya hay una grabación activa.'});
+          }
+
+          const videos = Array.from(document.querySelectorAll('video'))
+            .sort((a, b) =>
+              (b.clientWidth * b.clientHeight)
+              - (a.clientWidth * a.clientHeight)
+            );
+          const video = videos[0];
+
+          if (!video) {
+            return JSON.stringify({
+              ok:false,
+              error:'No se encontró un elemento <video> en el reproductor.'
+            });
+          }
+          if (typeof video.captureStream !== 'function') {
+            return JSON.stringify({
+              ok:false,
+              error:'Este reproductor no expone captureStream().'
+            });
+          }
+
+          let stream;
+          try {
+            stream = video.captureStream();
+          } catch (error) {
+            return JSON.stringify({
+              ok:false,
+              error:'captureStream() falló: ' + String(error)
+            });
+          }
+
+          const videoTracks = stream.getVideoTracks();
+          const audioTracks = stream.getAudioTracks();
+          if (!videoTracks.length) {
+            return JSON.stringify({
+              ok:false,
+              error:'captureStream() no entregó una pista de video.'
+            });
+          }
+
+          const candidates = [
+            'video/webm;codecs=vp9,opus',
+            'video/webm;codecs=vp8,opus',
+            'video/webm'
+          ];
+          const mimeType =
+            candidates.find(type => MediaRecorder.isTypeSupported(type)) || '';
+
+          let recorder;
+          try {
+            recorder = mimeType
+              ? new MediaRecorder(stream, {
+                  mimeType,
+                  videoBitsPerSecond: 8000000
+                })
+              : new MediaRecorder(stream, {
+                  videoBitsPerSecond: 8000000
+                });
+          } catch (error) {
+            return JSON.stringify({
+              ok:false,
+              error:'MediaRecorder no pudo iniciarse: ' + String(error)
+            });
+          }
+
+          const previousMuted = video.muted;
+          const chunks = [];
+
+          recorder.ondataavailable = event => {
+            if (event.data && event.data.size > 0) {
+              chunks.push(event.data);
+            }
+          };
+
+          recorder.onerror = event => {
+            window.__ELECTRO_REC.error = String(
+              event.error || event || 'Error de MediaRecorder'
+            );
+          };
+
+          recorder.onstop = () => {
+            window.__ELECTRO_REC.stopped = true;
+            try {
+              video.muted = previousMuted;
+            } catch (_) {}
+          };
+
+          window.__ELECTRO_REC = {
+            active: true,
+            stopped: false,
+            error: '',
+            recorder,
+            stream,
+            video,
+            previousMuted,
+            chunks
+          };
+
+          try {
+            recorder.start(1000);
+          } catch (error) {
+            window.__ELECTRO_REC.active = false;
+            return JSON.stringify({
+              ok:false,
+              error:'No se pudo iniciar MediaRecorder: ' + String(error)
+            });
+          }
+
+          if (__SILENT__) {
+            try { video.muted = true; } catch (_) {}
+          }
+
+          return JSON.stringify({
+            ok:true,
+            mimeType:recorder.mimeType || 'video/webm',
+            videoTracks:videoTracks.length,
+            audioTracks:audioTracks.length,
+            silent:__SILENT__,
+            paused:video.paused
+          });
+        })();
+        """.replaceAll("__SILENT__", silent ? "true" : "false")
+
+        try:
+            raw = self.window.evaluate_js(script)
+            result = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as exc:
+            handle.close()
+            target.unlink(missing_ok=True)
+            emit("recording_error", message=f"No se pudo iniciar la captura: {exc}")
+            return
+
+        if not isinstance(result, dict) or not result.get("ok"):
+            handle.close()
+            target.unlink(missing_ok=True)
+            message = (
+                str(result.get("error"))
+                if isinstance(result, dict)
+                else "Respuesta inválida del navegador."
+            )
+            emit("recording_error", message=message)
+            return
+
+        with self._lock:
+            self._active = True
+            self._stopping = False
+            self._destination = str(target)
+            self._handle = handle
+
+        emit(
+            "recording_started",
+            destination=str(target),
+            mime_type=str(result.get("mimeType") or "video/webm"),
+            video_tracks=int(result.get("videoTracks") or 0),
+            audio_tracks=int(result.get("audioTracks") or 0),
+            silent=bool(result.get("silent")),
+            paused=bool(result.get("paused")),
+        )
+
+        self._worker = threading.Thread(
+            target=self._drain_loop,
+            name="webview2-media-recorder",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def stop(self) -> None:
+        with self._lock:
+            if not self._active:
+                emit("recording_error", message="No hay una grabación activa.")
+                return
+            self._stopping = True
+
+        try:
+            self.window.evaluate_js(
+                """
+                (() => {
+                  const rec = window.__ELECTRO_REC;
+                  if (!rec || !rec.recorder) return false;
+                  rec.active = false;
+                  if (rec.recorder.state !== 'inactive') {
+                    rec.recorder.requestData();
+                    rec.recorder.stop();
+                  }
+                  return true;
+                })();
+                """
+            )
+            emit("recording_stopping")
+        except Exception as exc:
+            emit("recording_error", message=f"No se pudo detener MediaRecorder: {exc}")
+
+    def abort(self) -> None:
+        with self._lock:
+            destination = self._destination
+            handle = self._handle
+            self._active = False
+            self._stopping = False
+            self._destination = ""
+            self._handle = None
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        if destination:
+            try:
+                Path(destination).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _drain_loop(self) -> None:
+        try:
+            while True:
+                packet = self._take_chunk()
+                if packet.get("error"):
+                    raise RuntimeError(str(packet["error"]))
+
+                payload = str(packet.get("data") or "")
+                if payload:
+                    data = base64.b64decode(payload)
+                    with self._lock:
+                        handle = self._handle
+                    if handle is None:
+                        return
+                    handle.write(data)
+                    handle.flush()
+
+                stopped = bool(packet.get("stopped"))
+                empty = not bool(packet.get("has_more"))
+                with self._lock:
+                    stopping = self._stopping
+
+                if stopping and stopped and empty:
+                    break
+
+                time.sleep(0.20 if payload else 0.50)
+
+            with self._lock:
+                destination = self._destination
+                handle = self._handle
+                self._active = False
+                self._stopping = False
+                self._destination = ""
+                self._handle = None
+
+            if handle is not None:
+                handle.close()
+
+            if destination:
+                emit("recording_saved", path=destination)
+        except Exception as exc:
+            self.abort()
+            emit("recording_error", message=f"Error durante la grabación: {exc}")
+
+    def _take_chunk(self) -> dict[str, object]:
+        raw = self.window.evaluate_js(
+            """
+            (async () => {
+              const rec = window.__ELECTRO_REC;
+              if (!rec) {
+                return JSON.stringify({
+                  data:'',
+                  has_more:false,
+                  stopped:true,
+                  error:'El grabador del navegador desapareció.'
+                });
+              }
+
+              if (rec.error) {
+                return JSON.stringify({
+                  data:'',
+                  has_more:rec.chunks.length > 0,
+                  stopped:rec.stopped,
+                  error:rec.error
+                });
+              }
+
+              const blob = rec.chunks.shift();
+              if (!blob) {
+                return JSON.stringify({
+                  data:'',
+                  has_more:false,
+                  stopped:rec.stopped,
+                  error:''
+                });
+              }
+
+              const buffer = await blob.arrayBuffer();
+              const bytes = new Uint8Array(buffer);
+              let binary = '';
+              const step = 0x8000;
+              for (let i = 0; i < bytes.length; i += step) {
+                binary += String.fromCharCode(
+                  ...bytes.subarray(i, i + step)
+                );
+              }
+
+              return JSON.stringify({
+                data:btoa(binary),
+                has_more:rec.chunks.length > 0,
+                stopped:rec.stopped,
+                error:''
+              });
+            })();
+            """
+        )
+        if isinstance(raw, str):
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        return raw if isinstance(raw, dict) else {}
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         return 2
@@ -354,6 +699,8 @@ def main() -> int:
         text_select=True,
         confirm_close=False,
     )
+
+    media_recorder = BrowserMediaRecorder(window)
 
     def on_before_show() -> None:
         install_navigation_guard(window, state)
@@ -493,136 +840,14 @@ def main() -> int:
                     for frame in frames:
                         emit("iframe", url=frame, from_url=current)
                     emit_media_snapshot(window, state)
-                elif action == "prepare_recording":
-                    script = """
-                    (async () => {
-                      const result = {
-                        played: false,
-                        quality: '',
-                        backend: 'html5',
-                        detail: ''
-                      };
-
-                      try {
-                        if (typeof window.jwplayer === 'function') {
-                          let player = null;
-                          try {
-                            player = window.jwplayer();
-                          } catch (_) {}
-
-                          if (player) {
-                            result.backend = 'jwplayer';
-
-                            try {
-                              const levels = player.getQualityLevels?.() || [];
-                              if (levels.length) {
-                                let bestIndex = 0;
-                                let bestScore = -1;
-
-                                levels.forEach((level, index) => {
-                                  const label = String(level?.label || '');
-                                  const heightMatch = label.match(/(\\d{3,4})\\s*p/i);
-                                  const height = heightMatch
-                                    ? Number(heightMatch[1])
-                                    : Number(level?.height || 0);
-                                  const width = Number(level?.width || 0);
-                                  const bitrate = Number(
-                                    level?.bitrate
-                                    || level?.bandwidth
-                                    || 0
-                                  );
-
-                                  const score =
-                                    (height * 1000000000)
-                                    + (width * 1000000)
-                                    + bitrate;
-
-                                  if (score > bestScore) {
-                                    bestScore = score;
-                                    bestIndex = index;
-                                  }
-                                });
-
-                                try {
-                                  player.setCurrentQuality(bestIndex);
-                                  const best = levels[bestIndex] || {};
-                                  result.quality = String(
-                                    best.label
-                                    || best.height
-                                    || ('nivel ' + bestIndex)
-                                  );
-                                } catch (_) {}
-                              }
-                            } catch (_) {}
-
-                            try {
-                              player.play(true);
-                              result.played = true;
-                              result.detail = 'Play enviado por JW Player API';
-                            } catch (_) {}
-                          }
-                        }
-
-                        if (!result.played) {
-                          const videos = Array.from(
-                            document.querySelectorAll('video')
-                          ).sort(
-                            (a, b) =>
-                              (b.clientWidth * b.clientHeight)
-                              - (a.clientWidth * a.clientHeight)
-                          );
-
-                          const video = videos[0];
-                          if (video) {
-                            result.backend = 'html5';
-                            try {
-                              await video.play();
-                              result.played = !video.paused;
-                              result.detail = 'Play enviado al elemento <video>';
-                            } catch (error) {
-                              result.detail = String(error);
-                            }
-                          } else {
-                            result.detail = 'No se encontró un reproductor controlable.';
-                          }
-                        }
-                      } catch (error) {
-                        result.detail = String(error);
-                      }
-
-                      return JSON.stringify(result);
-                    })();
-                    """
-
-                    raw_result = window.evaluate_js(script)
-                    if isinstance(raw_result, str):
-                        try:
-                            result = json.loads(raw_result)
-                        except json.JSONDecodeError:
-                            result = {
-                                "played": False,
-                                "quality": "",
-                                "backend": "",
-                                "detail": raw_result,
-                            }
-                    elif isinstance(raw_result, dict):
-                        result = raw_result
-                    else:
-                        result = {
-                            "played": False,
-                            "quality": "",
-                            "backend": "",
-                            "detail": "Respuesta inválida del reproductor.",
-                        }
-
-                    emit(
-                        "player_control",
-                        played=bool(result.get("played")),
-                        quality=str(result.get("quality") or ""),
-                        backend=str(result.get("backend") or ""),
-                        detail=str(result.get("detail") or ""),
-                    )
+                elif action == "start_recording":
+                    destination = str(command.get("destination") or "")
+                    silent = bool(command.get("silent", True))
+                    media_recorder.start(destination, silent=silent)
+                elif action == "stop_recording":
+                    media_recorder.stop()
                 elif action == "close":
+                    media_recorder.abort()
                     window.destroy()
                     return
             except Exception as exc:
