@@ -94,6 +94,8 @@ La aplicación incorpora QtWebEngine en la pestaña **Navegador**. Al cargar o r
 
 Esto permite encontrar fuentes y variantes que no están presentes en el HTML inicial. Los enlaces `blob:` no se descargan directamente; se intenta detectar la fuente de red subyacente.
 
+La pestaña **Navegador** también registra navegación del documento principal, cambios de URL, redirecciones, recargas y solicitudes de nuevas ventanas/popups. Los popups se registran pero no se abren automáticamente, de modo que una página no puede desplazar silenciosamente la sesión de extracción a otra ventana.
+
 ### Sesión del navegador
 
 Cuando QtWebEngine captura una fuente, Electro Vid-WebExt conserva temporalmente el contexto útil de esa petición (Referer, User-Agent, Origin y cookies aplicables) y lo reutiliza con mpv, FFprobe y FFmpeg cuando es posible. Esto mejora la compatibilidad con servidores que reproducen correctamente en el navegador pero rechazan peticiones externas sin sesión.
