@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import re
-import shutil
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from PySide6.QtCore import QObject, QProcess, QStandardPaths, QThread, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QStandardPaths, QThread, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -285,9 +284,8 @@ class MainWindow(QMainWindow):
         self._download_destination_existed_before = False
         self._download_cancel_requested = False
         self._last_download_path: str | None = None
-        self._record_process: QProcess | None = None
+        self._browser_recording_active = False
         self._record_destination: str | None = None
-        self._record_stderr = ""
 
         self._sources: list[VideoSource] = []
         self._known_urls: set[str] = set()
@@ -431,8 +429,8 @@ class MainWindow(QMainWindow):
         self.download_button.setProperty("role", "success")
         self.record_button = QPushButton("● Grabar reproducción")
         self.record_button.setToolTip(
-            "Inicia la captura, intenta seleccionar la mayor calidad disponible "
-            "y envía Play automáticamente al reproductor WebView2."
+            "Graba directamente el elemento de video de WebView2 con audio, "
+            "selecciona la mayor calidad disponible y envía Play automáticamente."
         )
         self.open_folder_button = QPushButton("📁 Abrir carpeta")
         self.open_folder_button.setEnabled(False)
@@ -586,6 +584,7 @@ class MainWindow(QMainWindow):
         self.browser.navigation_event.connect(self._browser_navigation_event)
         self.browser.embedded_page_found.connect(self._embedded_page_found)
         self.browser.player_control_event.connect(self._player_control_result)
+        self.browser.recording_event.connect(self._browser_recording_event)
 
         self.navigation_table = QTableWidget(0, 4)
         self.navigation_table.setHorizontalHeaderLabels(
@@ -1632,21 +1631,10 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def toggle_browser_recording(self) -> None:
-        process = self._record_process
-        if (
-            process is not None
-            and process.state() != QProcess.ProcessState.NotRunning
-        ):
-            self._stop_browser_recording()
-            return
-
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
-            QMessageBox.warning(
-                self,
-                "FFmpeg no disponible",
-                "No se encontró FFmpeg en el PATH.",
-            )
+        if self._browser_recording_active:
+            self.record_button.setEnabled(False)
+            self.status_label.setText("Finalizando grabación del reproductor…")
+            self.browser.stop_recording()
             return
 
         downloads = QStandardPaths.writableLocation(
@@ -1654,217 +1642,142 @@ class MainWindow(QMainWindow):
         )
         initial = str(
             Path(downloads or str(Path.home()))
-            / "grabacion-webview2.mp4"
+            / "grabacion-webview2.webm"
         )
         destination, _ = QFileDialog.getSaveFileName(
             self,
-            "Guardar grabación de WebView2",
+            "Guardar grabación del reproductor",
             initial,
-            "Video MP4 (*.mp4)",
+            "Video WebM (*.webm)",
         )
         if not destination:
             return
-        if not destination.lower().endswith(".mp4"):
-            destination += ".mp4"
+        if not destination.lower().endswith(".webm"):
+            destination += ".webm"
 
         target = Path(destination)
         target.parent.mkdir(parents=True, exist_ok=True)
-
-        process = QProcess(self)
-        process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
-        process.setProgram(ffmpeg)
-        process.setArguments(
-            [
-                "-hide_banner",
-                "-loglevel",
-                "warning",
-                "-y",
-                "-f",
-                "gdigrab",
-                "-framerate",
-                "30",
-                "-i",
-                "title=Electro Vid-WebExt · WebView2",
-                "-vf",
-                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "20",
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                destination,
-            ]
-        )
-        process.readyReadStandardError.connect(self._recording_read_stderr)
-        process.started.connect(self._recording_started)
-        process.finished.connect(self._recording_finished)
-
-        self._record_process = process
-        self._record_destination = destination
-        self._record_stderr = ""
-        self.record_button.setEnabled(False)
-        self.status_label.setText(
-            "Iniciando grabación de la ventana WebView2…"
-        )
-        process.start()
-
-        if not process.waitForStarted(3000):
-            self.record_button.setEnabled(True)
-            self.record_button.setText("● Grabar reproducción")
-            self._record_process = None
-            self._record_destination = None
+        try:
+            target.unlink(missing_ok=True)
+        except OSError as exc:
             QMessageBox.warning(
                 self,
-                "No se pudo grabar",
-                "FFmpeg no pudo iniciar la captura de la ventana WebView2. "
-                "Comprueba que la ventana esté abierta y visible.",
+                "No se puede guardar",
+                f"No se pudo preparar el archivo de destino:\n{exc}",
             )
+            return
 
-    @Slot()
-    def _recording_started(self) -> None:
-        self.record_button.setEnabled(True)
-        self.record_button.setText("■ Detener grabación")
+        self._record_destination = destination
+        self.record_button.setEnabled(False)
         self.status_label.setText(
-            "Grabación iniciada; configurando calidad máxima y enviando Play…"
+            "Iniciando grabación directa del reproductor; seleccionando calidad máxima y Play…"
         )
-        QTimer.singleShot(350, self.browser.prepare_recording_playback)
+        self.browser.start_recording(destination, silent=True)
 
     @Slot(object)
-    def _player_control_result(self, event: object) -> None:
+    def _browser_recording_event(self, event: object) -> None:
         if not isinstance(event, dict):
             return
 
-        played = bool(event.get("played"))
-        quality = str(event.get("quality") or "").strip()
-        backend = str(event.get("backend") or "").strip()
-        detail = str(event.get("detail") or "").strip()
+        event_type = str(event.get("type") or "")
 
-        parts: list[str] = []
-        if quality:
-            parts.append(f"calidad {quality}")
-        if backend:
-            parts.append(backend)
+        if event_type == "recording_started":
+            self._browser_recording_active = True
+            self.record_button.setEnabled(True)
+            self.record_button.setText("■ Detener grabación")
 
-        if played:
-            suffix = f" ({', '.join(parts)})" if parts else ""
-            self.status_label.setText(
-                "Grabando: reproducción iniciada automáticamente"
-                f"{suffix}. Pulsa Detener grabación cuando quieras terminar."
+            played = bool(event.get("played"))
+            quality = str(event.get("quality") or "").strip()
+            backend = str(event.get("backend") or "").strip()
+            audio_tracks = int(event.get("audio_tracks") or 0)
+
+            parts: list[str] = []
+            if quality:
+                parts.append(f"calidad {quality}")
+            if backend:
+                parts.append(backend)
+            parts.append(
+                "audio capturado" if audio_tracks > 0 else "sin pista de audio capturable"
             )
-        else:
-            self.status_label.setText(
-                "La grabación empezó, pero no pude iniciar Play automáticamente. "
-                + (detail or "Pulsa Play manualmente en WebView2.")
-            )
+            suffix = ", ".join(parts)
 
-    @Slot()
-    def _recording_read_stderr(self) -> None:
-        process = self._record_process
-        if process is None:
-            return
-        text = bytes(process.readAllStandardError()).decode(
-            "utf-8",
-            errors="replace",
-        )
-        if text:
-            self._record_stderr = (self._record_stderr + text)[-6000:]
-
-    def _stop_browser_recording(self) -> None:
-        process = self._record_process
-        if (
-            process is None
-            or process.state() == QProcess.ProcessState.NotRunning
-        ):
+            if played:
+                self.status_label.setText(
+                    f"Grabando en segundo plano ({suffix}). "
+                    "Puedes minimizar WebView2; la salida local está silenciada."
+                )
+            else:
+                self.status_label.setText(
+                    f"Grabación iniciada ({suffix}), pero Play automático no respondió. "
+                    "Pulsa Play manualmente en WebView2."
+                )
             return
 
-        self.record_button.setEnabled(False)
-        self.status_label.setText("Finalizando grabación…")
-        process.write(b"q\n")
-        process.waitForBytesWritten(500)
+        if event_type == "recording_stopping":
+            self.record_button.setEnabled(False)
+            self.status_label.setText("Cerrando y guardando la grabación WebM…")
+            return
 
-        QTimer.singleShot(2500, self._force_stop_recording_if_needed)
-
-    @Slot()
-    def _force_stop_recording_if_needed(self) -> None:
-        process = self._record_process
-        if (
-            process is not None
-            and process.state() != QProcess.ProcessState.NotRunning
-        ):
-            process.terminate()
-            QTimer.singleShot(
-                1200,
-                lambda: (
-                    process.kill()
-                    if process.state() != QProcess.ProcessState.NotRunning
-                    else None
-                ),
+        if event_type == "recording_saved":
+            destination = str(
+                event.get("path")
+                or self._record_destination
+                or ""
             )
+            self._browser_recording_active = False
+            self._record_destination = None
+            self.record_button.setEnabled(True)
+            self.record_button.setText("● Grabar reproducción")
 
-    @Slot(int, QProcess.ExitStatus)
-    def _recording_finished(
-        self,
-        exit_code: int,
-        exit_status: QProcess.ExitStatus,
-    ) -> None:
-        destination = self._record_destination
-        process = self._record_process
+            valid = False
+            if destination:
+                target = Path(destination)
+                valid = target.exists() and target.stat().st_size > 0
 
-        if process is not None:
-            remaining = bytes(process.readAllStandardError()).decode(
-                "utf-8",
-                errors="replace",
-            )
-            if remaining:
-                self._record_stderr = (
-                    self._record_stderr + remaining
-                )[-6000:]
-            process.deleteLater()
+            if not valid:
+                self.status_label.setText(
+                    "La grabación terminó, pero el archivo no contiene datos."
+                )
+                QMessageBox.warning(
+                    self,
+                    "Grabación incompleta",
+                    "WebView2 terminó la grabación, pero no se obtuvo un archivo válido.",
+                )
+                return
 
-        self._record_process = None
-        self._record_destination = None
-        self.record_button.setEnabled(True)
-        self.record_button.setText("● Grabar reproducción")
-
-        valid = False
-        if destination:
-            target = Path(destination)
-            valid = target.exists() and target.stat().st_size > 0
-
-        if valid:
             self._last_download_path = destination
             self.open_folder_button.setEnabled(True)
             self.open_folder_preview_button.setEnabled(True)
-            self.status_label.setText(
-                f"Grabación terminada: {destination}"
-            )
+            self.status_label.setText(f"Grabación terminada: {destination}")
             QMessageBox.information(
                 self,
                 "Grabación terminada",
-                "La captura de la ventana WebView2 se guardó correctamente.\n\n"
-                "Esta primera versión contiene video de la ventana; "
-                "el audio del sistema se añadirá después de validar la captura.",
+                "La reproducción se guardó directamente desde WebView2. "
+                "El archivo puede contener video y audio aunque la salida local "
+                "haya estado silenciada.",
             )
             return
 
-        error = self._record_stderr.strip()
-        if len(error) > 1800:
-            error = error[-1800:]
-        self.status_label.setText("La grabación de WebView2 falló.")
-        QMessageBox.warning(
-            self,
-            "Error de grabación",
-            error
-            or (
-                "FFmpeg no pudo capturar la ventana. Comprueba que "
-                "'Electro Vid-WebExt · WebView2' esté abierta y visible."
-            ),
-        )
+        if event_type == "recording_error":
+            self._browser_recording_active = False
+            self._record_destination = None
+            self.record_button.setEnabled(True)
+            self.record_button.setText("● Grabar reproducción")
+            message = str(
+                event.get("message")
+                or "WebView2 no pudo grabar el reproductor."
+            )
+            self.status_label.setText("La grabación directa de WebView2 falló.")
+            QMessageBox.warning(
+                self,
+                "Error de grabación",
+                message,
+            )
+
+    @Slot(object)
+    def _player_control_result(self, event: object) -> None:
+        # Se conserva por compatibilidad con versiones previas del bridge.
+        return
 
     @Slot()
     def download_selected(self) -> None:
@@ -2221,19 +2134,12 @@ class MainWindow(QMainWindow):
 
         self._player_timer.stop()
 
-        if (
-            self._record_process is not None
-            and self._record_process.state() != QProcess.ProcessState.NotRunning
-        ):
+        if self._browser_recording_active:
             try:
-                self._record_process.write(b"q\n")
-                self._record_process.waitForBytesWritten(300)
-                self._record_process.waitForFinished(1200)
+                self.browser.stop_recording()
             except Exception:
                 pass
-            if self._record_process.state() != QProcess.ProcessState.NotRunning:
-                self._record_process.kill()
-                self._record_process.waitForFinished(800)
+            self._browser_recording_active = False
 
         if self._mpv is not None:
             try:
