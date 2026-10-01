@@ -17,7 +17,6 @@ class BrowserView(QWidget):
     embedded_page_found = Signal(str)
     page_ready = Signal()
     player_control_event = Signal(object)
-    recording_event = Signal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -202,15 +201,6 @@ class BrowserView(QWidget):
             self.player_control_event.emit(event)
             return
 
-        if event_type in {
-            "recording_started",
-            "recording_stopping",
-            "recording_saved",
-            "recording_error",
-        }:
-            self.recording_event.emit(event)
-            return
-
         if event_type == "navigation":
             target = str(event.get("to") or "")
             if target:
@@ -276,17 +266,8 @@ class BrowserView(QWidget):
         data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
         process.write(data)
 
-    def start_recording(self, destination: str, silent: bool = True) -> None:
-        self._send(
-            {
-                "action": "start_recording",
-                "destination": destination,
-                "silent": bool(silent),
-            }
-        )
-
-    def stop_recording(self) -> None:
-        self._send({"action": "stop_recording"})
+    def prepare_recording_playback(self) -> None:
+        self._send({"action": "prepare_recording"})
 
     def back(self) -> None:
         self._send({"action": "back"})
