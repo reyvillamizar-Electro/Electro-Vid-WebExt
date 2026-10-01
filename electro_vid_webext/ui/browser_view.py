@@ -1,209 +1,17 @@
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
+import json
+import sys
+from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QTimer, QUrl, Signal
-from PySide6.QtWebEngineCore import (
-    QWebEnginePage,
-    QWebEngineProfile,
-    QWebEngineScript,
-    QWebEngineUrlRequestInfo,
-    QWebEngineUrlRequestInterceptor,
-)
-from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QProcess, QProcessEnvironment, Signal
+from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
-from electro_vid_webext.core.detector import VideoSource, media_kind_from_url
-
-_MEDIA_HINT_RE = re.compile(
-    r"(?:\.mp4|\.webm|\.m3u8|\.mpd|\.mov|\.m4v|\.mkv)(?:$|[?#])",
-    re.IGNORECASE,
-)
+from electro_vid_webext.core.detector import VideoSource
 
 
-@dataclass(slots=True)
-class _CookieRecord:
-    name: str
-    value: str
-    domain: str
-    path: str
-    secure: bool
-
-
-def _bytes_text(value) -> str:
-    try:
-        return bytes(value).decode("utf-8", errors="replace")
-    except Exception:
-        return str(value)
-
-
-class MediaRequestInterceptor(QWebEngineUrlRequestInterceptor):
-    media_found = Signal(object)
-    navigation_seen = Signal(object)
-    embedded_page_seen = Signal(str)
-
-    def interceptRequest(self, info: QWebEngineUrlRequestInfo) -> None:
-        url = info.requestUrl().toString()
-        kind = media_kind_from_url(url)
-
-        try:
-            is_main_frame = (
-                info.resourceType()
-                == QWebEngineUrlRequestInfo.ResourceType.ResourceTypeMainFrame
-            )
-        except Exception:
-            is_main_frame = False
-
-        if is_main_frame:
-            self.navigation_seen.emit(
-                {
-                    "event": "Solicitud principal",
-                    "url": url,
-                    "first_party": info.firstPartyUrl().toString(),
-                }
-            )
-
-        try:
-            is_sub_frame = (
-                info.resourceType()
-                == QWebEngineUrlRequestInfo.ResourceType.ResourceTypeSubFrame
-            )
-        except Exception:
-            is_sub_frame = False
-
-        if is_sub_frame:
-            self.navigation_seen.emit(
-                {
-                    "event": "Iframe / subframe",
-                    "url": url,
-                    "first_party": info.firstPartyUrl().toString(),
-                }
-            )
-            self.embedded_page_seen.emit(url)
-
-        is_media_resource = (
-            info.resourceType() == QWebEngineUrlRequestInfo.ResourceType.ResourceTypeMedia
-        )
-        if not kind and not is_media_resource and not _MEDIA_HINT_RE.search(url.lower()):
-            return
-
-        headers: dict[str, str] = {}
-        try:
-            for key, value in info.httpHeaders().items():
-                headers[_bytes_text(key).lower()] = _bytes_text(value)
-        except Exception:
-            pass
-
-        first_party = info.firstPartyUrl().toString()
-        referer = headers.get("referer") or first_party or None
-        origin = headers.get("origin")
-
-        self.media_found.emit(
-            {
-                "url": url,
-                "kind": kind or "Media",
-                "origin": f"Red · {kind or 'Media'}",
-                "referer": referer,
-                "cookie_header": headers.get("cookie"),
-                "origin_header": origin,
-            }
-        )
-
-
-class QuietWebEnginePage(QWebEnginePage):
-    certificate_problem = Signal(object)
-
-    def __init__(self, profile: QWebEngineProfile, parent=None) -> None:
-        super().__init__(profile, parent)
-
-        # The embedded browser is an extractor, not a personal browser.
-        # Deny sensitive browser permissions and cancel WebAuth/passkey flows.
-        self.permissionRequested.connect(self._deny_permission)
-        self.webAuthUxRequested.connect(self._cancel_webauth)
-        self.fileSystemAccessRequested.connect(self._reject_file_system_access)
-        try:
-            self.certificateError.connect(self._reject_certificate_error)
-        except Exception:
-            pass
-
-    @staticmethod
-    def _deny_permission(permission) -> None:
-        try:
-            permission.deny()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _cancel_webauth(request) -> None:
-        try:
-            request.cancel()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _reject_file_system_access(request) -> None:
-        try:
-            request.reject()
-        except Exception:
-            pass
-
-    def _reject_certificate_error(self, error) -> None:
-        url = ""
-        description = ""
-        error_type = "Certificado inválido"
-
-        try:
-            url = error.url().toString()
-        except Exception:
-            pass
-
-        try:
-            description = str(error.description() or "")
-        except Exception:
-            pass
-
-        try:
-            error_type = str(error.type()).split(".")[-1]
-        except Exception:
-            pass
-
-        try:
-            error.rejectCertificate()
-        except Exception:
-            pass
-
-        self.certificate_problem.emit(
-            {
-                "event": "SSL bloqueado",
-                "url": url,
-                "detail": description or error_type,
-                "error_type": error_type,
-            }
-        )
-
-    def chooseFiles(self, mode, old_files, accepted_mime_types):
-        # Do not allow web pages to open local file pickers from extractor mode.
-        return []
-
-    def createWindow(self, window_type):
-        # Block popup windows. They are not required for media extraction.
-        return None
-
-    def javaScriptConsoleMessage(
-        self,
-        level,
-        message: str,
-        line_number: int,
-        source_id: str,
-    ) -> None:
-        # Suppress console noise produced by third-party pages. The extractor
-        # surfaces its own failures through the application status/UI instead.
-        return
-
-
-class BrowserView(QWebEngineView):
+class BrowserView(QWidget):
     media_found = Signal(object)
     navigation_event = Signal(object)
     embedded_page_found = Signal(str)
@@ -212,439 +20,265 @@ class BrowserView(QWebEngineView):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
 
-        self._cookies: dict[tuple[str, str, str], _CookieRecord] = {}
+        self._process: QProcess | None = None
+        self._stdout_buffer = ""
         self._initial_url = ""
-        self._last_url = ""
-        self._embedded_seen: set[str] = set()
+        self._current_url = ""
+        self._user_agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0"
+        )
         self._shutting_down = False
 
-        # Clear data from the older versions that used Qt's default profile.
-        # This profile is not used for browsing anymore.
-        legacy_profile = QWebEngineProfile.defaultProfile()
-        try:
-            legacy_profile.cookieStore().deleteAllCookies()
-            legacy_profile.clearHttpCache()
-            legacy_profile.clearAllVisitedLinks()
-            for permission in legacy_profile.listAllPermissions():
-                permission.reset()
-        except Exception:
-            pass
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(8)
 
-        # A profile without a storage name is off-the-record: cookies/cache and
-        # permissions are kept only for the lifetime of this BrowserView.
-        app = QApplication.instance()
-        self.profile = QWebEngineProfile(app)
-        self.profile.setPersistentCookiesPolicy(
-            QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies
+        title = QLabel("Navegador: Microsoft Edge WebView2")
+        title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        self._status = QLabel(
+            "Al analizar una URL se abrirá una ventana WebView2 separada. "
+            "Esa ventana reproduce H.264/AAC de forma nativa y las fuentes "
+            "detectadas regresan automáticamente a Resultados."
         )
-        self.profile.setPersistentPermissionsPolicy(
-            QWebEngineProfile.PersistentPermissionsPolicy.StoreInMemory
-        )
-        self.profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
-        self.setPage(QuietWebEnginePage(self.profile, self))
-        self._media_compatibility_enabled = True
-        self._install_credential_blocker()
-        self._install_media_compatibility_shim()
+        self._status.setWordWrap(True)
+        self._current_label = QLabel("Sin página cargada.")
+        self._current_label.setWordWrap(True)
 
-        self.interceptor = MediaRequestInterceptor(self)
-        self.interceptor.media_found.connect(self._on_network_media)
-        self.interceptor.navigation_seen.connect(self._on_navigation_seen)
-        self.interceptor.embedded_page_seen.connect(self._on_embedded_page_seen)
-        self.profile.setUrlRequestInterceptor(self.interceptor)
+        layout.addStretch(1)
+        layout.addWidget(title)
+        layout.addWidget(self._status)
+        layout.addWidget(self._current_label)
+        layout.addStretch(1)
 
-        page = self.page()
-        if isinstance(page, QuietWebEnginePage):
-            page.certificate_problem.connect(self._on_certificate_problem)
-        page.navigationRequested.connect(self._on_navigation_requested)
-        page.newWindowRequested.connect(self._on_new_window_requested)
-        self.urlChanged.connect(self._on_url_changed)
-        self.loadStarted.connect(self._on_load_started)
+    def _bridge_path(self) -> Path:
+        return Path(__file__).resolve().parents[2] / "webview2_bridge.py"
 
-        cookie_store = self.profile.cookieStore()
-        cookie_store.cookieAdded.connect(self._cookie_added)
-        cookie_store.cookieRemoved.connect(self._cookie_removed)
+    def _stop_process(self) -> None:
+        process = self._process
+        if process is None:
+            return
 
-        self.loadFinished.connect(self._on_load_finished)
-
-    def _install_credential_blocker(self) -> None:
-        script = QWebEngineScript()
-        script.setName("ElectroVidWebExt.DisableCredentialAPIs")
-        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
-        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
-        script.setRunsOnSubFrames(True)
-        script.setSourceCode(
-            """
-            (() => {
-              const denied = () => Promise.reject(
-                new DOMException(
-                  'Credential and passkey APIs are disabled in extractor mode.',
-                  'NotAllowedError'
-                )
-              );
-
-              try {
-                if (navigator.credentials) {
-                  const proto = Object.getPrototypeOf(navigator.credentials);
-                  if (proto) {
-                    Object.defineProperty(proto, 'get', {
-                      value: denied,
-                      configurable: false,
-                      writable: false
-                    });
-                    Object.defineProperty(proto, 'create', {
-                      value: denied,
-                      configurable: false,
-                      writable: false
-                    });
-                    if ('store' in proto) {
-                      Object.defineProperty(proto, 'store', {
-                        value: denied,
-                        configurable: false,
-                        writable: false
-                      });
-                    }
-                  }
-                }
-              } catch (_) {}
-
-              try {
-                Object.defineProperty(window, 'PublicKeyCredential', {
-                  value: undefined,
-                  configurable: false,
-                  writable: false
-                });
-              } catch (_) {}
-            })();
-            """
-        )
-        self.page().scripts().insert(script)
-
-    def _install_media_compatibility_shim(self) -> None:
-        previous = getattr(self, "_media_compatibility_script", None)
-        if previous is not None:
+        if process.state() != QProcess.ProcessState.NotRunning:
             try:
-                self.page().scripts().remove(previous)
+                self._send({"action": "close"})
+                process.waitForFinished(800)
             except Exception:
                 pass
 
-        enabled_literal = (
-            "true" if self._media_compatibility_enabled else "false"
-        )
+        if process.state() != QProcess.ProcessState.NotRunning:
+            process.kill()
+            process.waitForFinished(1200)
 
-        script = QWebEngineScript()
-        script.setName("ElectroVidWebExt.MediaCompatibility")
-        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
-        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
-        script.setRunsOnSubFrames(True)
-        script.setSourceCode(
-            """
-            (() => {
-              if (window.__ELECTRO_MEDIA_COMPAT_INSTALLED__) {
-                return;
-              }
-
-              window.__ELECTRO_MEDIA_COMPAT_INSTALLED__ = true;
-              window.__ELECTRO_MEDIA_COMPAT__ = __DEFAULT_ENABLED__;
-
-              const targetType = (value) => {
-                const type = String(value || '').toLowerCase();
-                if (!type) return false;
-
-                const isH264 =
-                  type.includes('video/mp4') &&
-                  (type.includes('avc1') || type.includes('avc3'));
-
-                const isAac =
-                  (type.includes('audio/mp4') || type.includes('video/mp4')) &&
-                  type.includes('mp4a');
-
-                return isH264 || isAac;
-              };
-
-              try {
-                const originalCanPlayType =
-                  HTMLMediaElement.prototype.canPlayType;
-
-                Object.defineProperty(
-                  HTMLMediaElement.prototype,
-                  'canPlayType',
-                  {
-                    configurable: true,
-                    writable: true,
-                    value: function(type) {
-                      const actual = originalCanPlayType.call(this, type);
-                      if (actual) return actual;
-                      if (
-                        window.__ELECTRO_MEDIA_COMPAT__ &&
-                        targetType(type)
-                      ) {
-                        return 'probably';
-                      }
-                      return actual;
-                    }
-                  }
-                );
-              } catch (_) {}
-
-              try {
-                if (window.MediaSource && MediaSource.isTypeSupported) {
-                  const originalIsTypeSupported =
-                    MediaSource.isTypeSupported.bind(MediaSource);
-
-                  MediaSource.isTypeSupported = function(type) {
-                    const actual = originalIsTypeSupported(type);
-                    if (actual) return true;
-                    if (
-                      window.__ELECTRO_MEDIA_COMPAT__ &&
-                      targetType(type)
-                    ) {
-                      return true;
-                    }
-                    return false;
-                  };
-                }
-              } catch (_) {}
-
-              try {
-                if (
-                  navigator.mediaCapabilities &&
-                  navigator.mediaCapabilities.decodingInfo
-                ) {
-                  const originalDecodingInfo =
-                    navigator.mediaCapabilities.decodingInfo.bind(
-                      navigator.mediaCapabilities
-                    );
-
-                  navigator.mediaCapabilities.decodingInfo =
-                    async function(config) {
-                      const actual = await originalDecodingInfo(config);
-                      if (!window.__ELECTRO_MEDIA_COMPAT__) return actual;
-
-                      const videoType =
-                        config && config.video
-                          ? config.video.contentType
-                          : '';
-                      const audioType =
-                        config && config.audio
-                          ? config.audio.contentType
-                          : '';
-
-                      if (
-                        !actual.supported &&
-                        (targetType(videoType) || targetType(audioType))
-                      ) {
-                        return {
-                          supported: true,
-                          smooth: false,
-                          powerEfficient: false
-                        };
-                      }
-                      return actual;
-                    };
-                }
-              } catch (_) {}
-            })();
-            """
-        )
-        source = script.sourceCode().replace(
-            "__DEFAULT_ENABLED__",
-            enabled_literal,
-        )
-        script.setSourceCode(source)
-        self.page().scripts().insert(script)
-        self._media_compatibility_script = script
-
-    def set_media_compatibility(self, enabled: bool) -> None:
-        self._media_compatibility_enabled = bool(enabled)
-        self._install_media_compatibility_shim()
-        value = "true" if enabled else "false"
-        script = (
-            "window.__ELECTRO_MEDIA_COMPAT__ = "
-            + value
-            + ";"
-        )
-        try:
-            self.page().runJavaScript(script)
-        except Exception:
-            pass
-
-    def media_compatibility_enabled(self) -> bool:
-        return self._media_compatibility_enabled
-
-    def shutdown(self) -> None:
-        """Stop web activity before the main window is destroyed."""
-        self._shutting_down = True
-        try:
-            self.stop()
-        except Exception:
-            pass
-
-        try:
-            self.profile.setUrlRequestInterceptor(None)
-        except Exception:
-            pass
-
-        try:
-            self.setUrl(QUrl("about:blank"))
-        except Exception:
-            pass
-
-        try:
-            page = self.page()
-            page.deleteLater()
-        except Exception:
-            pass
+        process.deleteLater()
+        self._process = None
 
     def load_page(self, url: str) -> None:
+        if self._shutting_down:
+            return
+
+        self._stop_process()
+        self._stdout_buffer = ""
         self._initial_url = url
-        self._last_url = ""
-        self._embedded_seen.clear()
+        self._current_url = url
+        self._current_label.setText(f"WebView2: {url}")
+        self._status.setText(
+            "Abriendo WebView2… interactúa con la ventana del navegador. "
+            "Los reproductores embebidos y HLS se detectarán automáticamente."
+        )
+
         self.navigation_event.emit(
             {
                 "event": "URL inicial",
                 "from": "",
                 "to": url,
-                "detail": "Solicitada por Electro Vid-WebExt",
-            }
-        )
-        self.setUrl(QUrl(url))
-
-    def _on_certificate_problem(self, problem: object) -> None:
-        if not isinstance(problem, dict):
-            return
-
-        self.navigation_event.emit(
-            {
-                "event": str(problem.get("event") or "SSL bloqueado"),
-                "from": self.url().toString(),
-                "to": str(problem.get("url") or ""),
-                "detail": str(problem.get("detail") or problem.get("error_type") or ""),
+                "detail": "Microsoft Edge WebView2",
             }
         )
 
-    def _on_embedded_page_seen(self, url: str) -> None:
-        if not url or url in self._embedded_seen:
-            return
-        if url.startswith(("about:", "data:", "blob:")):
-            return
-        self._embedded_seen.add(url)
-        self.embedded_page_found.emit(url)
+        process = QProcess(self)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        process.readyReadStandardOutput.connect(self._read_stdout)
+        process.readyReadStandardError.connect(self._read_stderr)
+        process.finished.connect(self._process_finished)
 
-    def _on_navigation_seen(self, context: object) -> None:
-        if not isinstance(context, dict):
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONUNBUFFERED", "1")
+        process.setProcessEnvironment(env)
+
+        process.setProgram(sys.executable)
+        process.setArguments(
+            [
+                str(self._bridge_path()),
+                url,
+                "--auto-player",
+            ]
+        )
+        self._process = process
+        process.start()
+
+        if not process.waitForStarted(4000):
+            self._status.setText(
+                "No se pudo iniciar WebView2. Comprueba que Microsoft Edge "
+                "WebView2 Runtime esté instalado."
+            )
+
+    def _read_stdout(self) -> None:
+        process = self._process
+        if process is None:
             return
-        url = str(context.get("url") or "")
-        if not url:
-            return
-        self.navigation_event.emit(
-            {
-                "event": str(context.get("event") or "Solicitud principal"),
-                "from": str(context.get("first_party") or ""),
-                "to": url,
-                "detail": "Solicitud de documento principal observada en red",
-            }
+
+        self._stdout_buffer += bytes(process.readAllStandardOutput()).decode(
+            "utf-8",
+            errors="replace",
         )
 
-    def _on_navigation_requested(self, request) -> None:
-        try:
-            if not request.isMainFrame():
+        while "\n" in self._stdout_buffer:
+            line, self._stdout_buffer = self._stdout_buffer.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                self._handle_event(event)
+
+    def _read_stderr(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardError()).decode(
+            "utf-8",
+            errors="replace",
+        ).strip()
+        if text:
+            self.navigation_event.emit(
+                {
+                    "event": "WebView2 diagnóstico",
+                    "from": self._current_url,
+                    "to": "",
+                    "detail": text[-1200:],
+                }
+            )
+
+    def _handle_event(self, event: dict) -> None:
+        event_type = str(event.get("type") or "")
+
+        if event_type == "ready":
+            self._status.setText(
+                "WebView2 activo. Los popups y redirecciones publicitarias "
+                "se interceptan; las fuentes multimedia vuelven a Resultados."
+            )
+            self.page_ready.emit()
+            return
+
+        if event_type == "status":
+            message = str(event.get("message") or "")
+            if message:
+                self._status.setText(message)
+            return
+
+        if event_type == "diagnostic":
+            self.navigation_event.emit(
+                {
+                    "event": "WebView2 diagnóstico",
+                    "from": self._current_url,
+                    "to": "",
+                    "detail": str(event.get("message") or ""),
+                }
+            )
+            return
+
+        if event_type == "closed":
+            self._status.setText("La ventana WebView2 se cerró.")
+            return
+
+        if event_type == "navigation":
+            target = str(event.get("to") or "")
+            if target:
+                self._current_url = target
+                self._current_label.setText(f"WebView2: {target}")
+            self.navigation_event.emit(
+                {
+                    "event": str(event.get("event") or "Navegación"),
+                    "from": str(event.get("from_url") or ""),
+                    "to": target,
+                    "detail": str(event.get("detail") or ""),
+                }
+            )
+            return
+
+        if event_type == "iframe":
+            url = str(event.get("url") or "")
+            if not url:
                 return
-            url = request.url().toString()
-            navigation_type = str(request.navigationType()).split(".")[-1]
-        except Exception:
+            self.navigation_event.emit(
+                {
+                    "event": "Iframe / subframe",
+                    "from": str(event.get("from_url") or self._current_url),
+                    "to": url,
+                    "detail": "Detectado por WebView2",
+                }
+            )
+            self.embedded_page_found.emit(url)
             return
 
-        self.navigation_event.emit(
-            {
-                "event": "Navegación",
-                "from": self.url().toString(),
-                "to": url,
-                "detail": navigation_type,
-            }
-        )
-
-    def _on_new_window_requested(self, request) -> None:
-        try:
-            url = request.requestedUrl().toString()
-            destination = str(request.destination()).split(".")[-1]
-            initiated = bool(request.isUserInitiated())
-        except Exception:
-            return
-
-        self.navigation_event.emit(
-            {
-                "event": "Popup / nueva ventana",
-                "from": self.url().toString(),
-                "to": url,
-                "detail": (
-                    f"{destination} · "
-                    + ("iniciado por usuario" if initiated else "automático/bloqueado")
-                ),
-            }
-        )
-
-        kind = media_kind_from_url(url)
-        if kind:
+        if event_type == "media":
+            url = str(event.get("url") or "")
+            if not url:
+                return
+            user_agent = str(event.get("user_agent") or "").strip()
+            if user_agent:
+                self._user_agent = user_agent
             self.media_found.emit(
-                self.session_source(
+                VideoSource(
                     url=url,
-                    kind=kind,
-                    origin=f"Popup · {kind}",
-                    referer=self.url().toString() or None,
+                    kind=str(event.get("kind") or "Media"),
+                    origin=str(event.get("origin") or "WebView2"),
+                    referer=str(event.get("referer") or "") or self._current_url or None,
+                    user_agent=self._user_agent,
+                    cookie_header=str(event.get("cookie_header") or "") or None,
+                    origin_header=str(event.get("origin_header") or "") or None,
                 )
             )
 
-        # Intentionally do not call request.openIn(): extractor mode records
-        # the target but does not allow arbitrary popups to take over the UI.
+    def _process_finished(self) -> None:
+        if not self._shutting_down:
+            self._status.setText(
+                "La ventana WebView2 se cerró. Pulsa Analizar para abrirla nuevamente."
+            )
 
-    def _on_load_started(self) -> None:
-        QTimer.singleShot(
-            0,
-            lambda: self.set_media_compatibility(
-                self._media_compatibility_enabled
-            ),
-        )
-        requested = ""
-        try:
-            requested = self.page().requestedUrl().toString()
-        except Exception:
-            pass
-
-        self.navigation_event.emit(
-            {
-                "event": "Carga iniciada",
-                "from": self._last_url,
-                "to": requested or self.url().toString(),
-                "detail": "",
-            }
-        )
-
-    def _on_url_changed(self, url: QUrl) -> None:
-        current = url.toString()
-        previous = self._last_url
-        if current == previous:
+    def _send(self, payload: dict) -> None:
+        process = self._process
+        if (
+            process is None
+            or process.state() != QProcess.ProcessState.Running
+        ):
             return
+        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        process.write(data)
 
-        requested = ""
-        try:
-            requested = self.page().requestedUrl().toString()
-        except Exception:
-            pass
+    def back(self) -> None:
+        self._send({"action": "back"})
 
-        redirected = bool(requested and current and requested != current)
-        self.navigation_event.emit(
-            {
-                "event": "Redirección" if redirected else "URL cambió",
-                "from": previous,
-                "to": current,
-                "detail": (
-                    f"Solicitada originalmente: {requested}"
-                    if redirected
-                    else ""
-                ),
-            }
-        )
-        self._last_url = current
+    def reload(self) -> None:
+        self._send({"action": "reload"})
+
+    def rescan_dom(self) -> None:
+        self._send({"action": "rescan"})
+
+    def set_media_compatibility(self, enabled: bool) -> None:
+        # WebView2 has native H.264/AAC support; no compatibility shim is used.
+        return
+
+    def media_compatibility_enabled(self) -> bool:
+        return False
+
+    def cookie_header_for(self, url: str) -> str | None:
+        return None
 
     def session_source(
         self,
@@ -659,174 +293,12 @@ class BrowserView(QWebEngineView):
             url=url,
             kind=kind,
             origin=origin,
-            referer=referer or self.url().toString() or None,
-            user_agent=self.profile.httpUserAgent(),
-            cookie_header=cookie_header or self.cookie_header_for(url),
+            referer=referer or self._current_url or None,
+            user_agent=self._user_agent,
+            cookie_header=cookie_header,
             origin_header=origin_header,
         )
 
-    def cookie_header_for(self, url: str) -> str | None:
-        parsed = urlparse(url)
-        host = (parsed.hostname or "").lower()
-        path = parsed.path or "/"
-        secure_request = parsed.scheme.lower() == "https"
-
-        values: list[str] = []
-        for cookie in self._cookies.values():
-            domain = cookie.domain.lower().lstrip(".")
-            domain_ok = host == domain or host.endswith(f".{domain}")
-            path_ok = path.startswith(cookie.path or "/")
-            secure_ok = not cookie.secure or secure_request
-            if domain_ok and path_ok and secure_ok:
-                values.append(f"{cookie.name}={cookie.value}")
-
-        return "; ".join(values) if values else None
-
-    def _cookie_added(self, cookie) -> None:
-        record = _CookieRecord(
-            name=_bytes_text(cookie.name()),
-            value=_bytes_text(cookie.value()),
-            domain=str(cookie.domain() or ""),
-            path=str(cookie.path() or "/"),
-            secure=bool(cookie.isSecure()),
-        )
-        self._cookies[(record.name, record.domain, record.path)] = record
-
-    def _cookie_removed(self, cookie) -> None:
-        key = (
-            _bytes_text(cookie.name()),
-            str(cookie.domain() or ""),
-            str(cookie.path() or "/"),
-        )
-        self._cookies.pop(key, None)
-
-    def _on_network_media(self, context: object) -> None:
-        if not isinstance(context, dict):
-            return
-
-        url = str(context.get("url") or "")
-        if not url:
-            return
-
-        source = self.session_source(
-            url=url,
-            kind=str(context.get("kind") or "Media"),
-            origin=str(context.get("origin") or "Red"),
-            referer=context.get("referer"),
-            origin_header=context.get("origin_header"),
-            cookie_header=context.get("cookie_header"),
-        )
-        self.media_found.emit(source)
-
-    def _on_load_finished(self, ok: bool) -> None:
-        final_url = self.url().toString()
-        requested = ""
-        try:
-            requested = self.page().requestedUrl().toString()
-        except Exception:
-            pass
-
-        self.navigation_event.emit(
-            {
-                "event": "Carga completada" if ok else "Carga fallida",
-                "from": requested,
-                "to": final_url,
-                "detail": (
-                    "URL final distinta de la solicitada"
-                    if requested and final_url and requested != final_url
-                    else ""
-                ),
-            }
-        )
-
-        if not ok:
-            return
-        self.set_media_compatibility(self._media_compatibility_enabled)
-        self.rescan_dom()
-        QTimer.singleShot(1000, self.rescan_dom)
-        QTimer.singleShot(3000, self.rescan_dom)
-        QTimer.singleShot(7000, self.rescan_dom)
-        self.page_ready.emit()
-
-    def rescan_dom(self) -> None:
-        if self._shutting_down:
-            return
-        script = """
-        (() => {
-          const media = new Set();
-          const iframes = new Set();
-
-          const addMedia = (value) => {
-            if (!value || typeof value !== 'string') return;
-            if (value.startsWith('blob:') || value.startsWith('data:')) return;
-            media.add(value);
-          };
-
-          const addFrame = (value) => {
-            if (!value || typeof value !== 'string') return;
-            if (value.startsWith('about:') || value.startsWith('data:') || value.startsWith('blob:')) return;
-            try {
-              iframes.add(new URL(value, document.baseURI).href);
-            } catch (_) {}
-          };
-
-          document.querySelectorAll('video').forEach(video => {
-            addMedia(video.currentSrc);
-            addMedia(video.src);
-          });
-
-          document.querySelectorAll('source').forEach(source => addMedia(source.src));
-          document.querySelectorAll('iframe[src], frame[src]').forEach(frame => addFrame(frame.src));
-
-          try {
-            performance.getEntriesByType('resource').forEach(entry => {
-              addMedia(entry.name);
-              const type = String(entry.initiatorType || '').toLowerCase();
-              if (type === 'iframe' || type === 'frame') addFrame(entry.name);
-            });
-          } catch (_) {}
-
-          try {
-            const html = document.documentElement ? document.documentElement.innerHTML : '';
-            const re = /https?:\\/\\/[^"'\\s<>]+?\\.(?:mp4|webm|m3u8|mpd|mov|m4v|mkv)(?:\\?[^"'\\s<>]*)?/gi;
-            for (const match of html.matchAll(re)) addMedia(match[0].replace(/&amp;/g, '&'));
-          } catch (_) {}
-
-          return {
-            media: Array.from(media),
-            iframes: Array.from(iframes)
-          };
-        })();
-        """
-        self.page().runJavaScript(script, self._consume_dom_results)
-
-    def _consume_dom_results(self, values) -> None:
-        if self._shutting_down:
-            return
-        if not isinstance(values, dict):
-            return
-
-        media_values = values.get("media")
-        if isinstance(media_values, list):
-            for value in media_values:
-                if not isinstance(value, str):
-                    continue
-                kind = media_kind_from_url(value)
-                if not kind:
-                    continue
-
-                self.media_found.emit(
-                    self.session_source(
-                        url=value,
-                        kind=kind,
-                        origin=f"DOM/HTML dinámico · {kind}",
-                        referer=self.url().toString() or None,
-                    )
-                )
-
-        iframe_values = values.get("iframes")
-        if isinstance(iframe_values, list):
-            for value in iframe_values:
-                if not isinstance(value, str):
-                    continue
-                self._on_embedded_page_seen(value)
+    def shutdown(self) -> None:
+        self._shutting_down = True
+        self._stop_process()
