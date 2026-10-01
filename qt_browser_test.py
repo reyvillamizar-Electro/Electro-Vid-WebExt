@@ -1,3 +1,4 @@
+import json
 import sys
 
 from PySide6.QtCore import QUrl
@@ -102,13 +103,17 @@ class TestBrowser(QMainWindow):
             ['Vorbis (WebM)', 'audio', 'audio/webm; codecs="vorbis"']
           ];
 
-          return tests.map(([name, kind, mime]) => {
-            const element = kind === 'video' ? video : audio;
-            return {
-              name,
-              mime,
-              result: element.canPlayType(mime) || ''
-            };
+          return JSON.stringify({
+            userAgent: navigator.userAgent,
+            platform: navigator.platform,
+            tests: tests.map(([name, kind, mime]) => {
+              const element = kind === 'video' ? video : audio;
+              return {
+                name,
+                mime,
+                result: element.canPlayType(mime) || ''
+              };
+            })
           });
         })();
         """
@@ -116,12 +121,39 @@ class TestBrowser(QMainWindow):
         self.browser.page().runJavaScript(script, self._show_codec_results)
 
     def _show_codec_results(self, values) -> None:
-        if not isinstance(values, list):
-            self.codec_output.setPlainText("QtWebEngine no devolvió resultados.")
+        if not isinstance(values, str) or not values:
+            self.codec_output.setPlainText(
+                "QtWebEngine no devolvió el diagnóstico. "
+                "Resultado bruto: " + repr(values)
+            )
+            return
+
+        try:
+            values = json.loads(values)
+        except json.JSONDecodeError:
+            self.codec_output.setPlainText(
+                "No se pudo interpretar el diagnóstico. "
+                "Resultado bruto: " + values
+            )
+            return
+
+        if not isinstance(values, dict):
+            self.codec_output.setPlainText(
+                "El diagnóstico devolvió un tipo inesperado: " + repr(values)
+            )
+            return
+
+        tests = values.get("tests")
+        if not isinstance(tests, list):
+            self.codec_output.setPlainText(
+                "El diagnóstico no incluyó la lista de codecs: " + repr(values)
+            )
             return
 
         lines = [
             "Resultado de canPlayType() en QtWebEngine:",
+            f"User-Agent: {values.get('userAgent', '—')}",
+            f"Plataforma: {values.get('platform', '—')}",
             "",
             "probably = soporte fuerte",
             "maybe     = soporte posible",
@@ -129,7 +161,7 @@ class TestBrowser(QMainWindow):
             "",
         ]
 
-        for item in values:
+        for item in tests:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name") or "")
