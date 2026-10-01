@@ -369,6 +369,39 @@ TAKE_CHUNK_SCRIPT = r"""
 """
 
 
+PLAY_SCRIPT = r"""
+(async () => {
+  const videos = Array.from(document.querySelectorAll('video'))
+    .filter(video => video.readyState >= 2)
+    .sort(
+      (a, b) =>
+        (b.videoWidth * b.videoHeight || b.clientWidth * b.clientHeight)
+        - (a.videoWidth * a.videoHeight || a.clientWidth * a.clientHeight)
+    );
+
+  const video = videos[0];
+  if (!video) {
+    return {ok:false,played:false,error:'No se encontró el video para iniciar Play.'};
+  }
+
+  try {
+    await video.play();
+    return {
+      ok:true,
+      played:!video.paused,
+      currentTime:Number(video.currentTime || 0)
+    };
+  } catch (error) {
+    return {
+      ok:false,
+      played:false,
+      error:String(error)
+    };
+  }
+})()
+"""
+
+
 STOP_SCRIPT = r"""
 (() => {
   const rec = window.__ELECTRO_EXTERNAL_REC;
@@ -440,12 +473,40 @@ def main() -> int:
 
         handle = output.open("wb")
 
+        # MediaRecorder is already running and START_SCRIPT has already applied
+        # local mute when requested. Only now ask the existing player to Play;
+        # do not alter quality, seek position, playback rate, or any other state.
+        try:
+            play_result = client.evaluate(
+                PLAY_SCRIPT,
+                await_promise=True,
+            )
+        except Exception as exc:
+            play_result = {
+                "ok": False,
+                "played": False,
+                "error": str(exc),
+            }
+
+        if not isinstance(play_result, dict):
+            play_result = {
+                "ok": False,
+                "played": False,
+                "error": "Respuesta inválida al enviar Play.",
+            }
+
         emit(
             "started",
             output=str(output),
             target_url=str(target.get("url") or ""),
-            paused=bool(started.get("paused")),
-            current_time=float(started.get("currentTime") or 0),
+            paused=not bool(play_result.get("played")),
+            played=bool(play_result.get("played")),
+            play_error=str(play_result.get("error") or ""),
+            current_time=float(
+                play_result.get("currentTime")
+                or started.get("currentTime")
+                or 0
+            ),
             width=int(started.get("width") or 0),
             height=int(started.get("height") or 0),
             video_tracks=int(started.get("videoTracks") or 0),
