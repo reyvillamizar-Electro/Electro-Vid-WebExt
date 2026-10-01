@@ -31,6 +31,12 @@ BAD_CONTENT_TYPES = (
     "text/xml",
 )
 
+HLS_SEGMENT_EXTENSIONS = (
+    "3gp,aac,avi,ac3,eac3,flac,mkv,m3u8,m4a,m4s,m4v,"
+    "mpg,mov,mp2,mp3,mp4,mpeg,mpegts,ogg,ogv,oga,ts,"
+    "vob,vtt,wav,webvtt,cmfv,cmfa,ec3,fmp4,image"
+)
+
 
 def suggested_extension(url: str, kind: str) -> str:
     suffix = Path(urlparse(url).path).suffix.lower()
@@ -572,6 +578,102 @@ def _download_direct(
         raise
 
 
+def _probe_hls_stream_selection(
+    url: str,
+    referer: str | None,
+    user_agent: str | None,
+    cookie_header: str | None,
+    origin_header: str | None,
+) -> tuple[int | None, int | None]:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None, None
+
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-analyzeduration",
+        "20000000",
+        "-probesize",
+        "20000000",
+        "-allowed_segment_extensions",
+        HLS_SEGMENT_EXTENSIONS,
+        "-extension_picky",
+        "0",
+        "-user_agent",
+        _clean_header_value(user_agent) or USER_AGENT,
+    ]
+
+    clean_referer = _clean_header_value(referer)
+    if clean_referer:
+        command.extend(["-referer", clean_referer])
+
+    headers: list[str] = []
+    clean_cookie = _clean_header_value(cookie_header)
+    clean_origin = _clean_header_value(origin_header)
+    if clean_cookie:
+        headers.append(f"Cookie: {clean_cookie}")
+    if clean_origin:
+        headers.append(f"Origin: {clean_origin}")
+    if headers:
+        command.extend(["-headers", "\r\n".join(headers) + "\r\n"])
+
+    command.extend(
+        [
+            "-show_entries",
+            "stream=index,codec_type,codec_name,width,height:stream_disposition=attached_pic",
+            "-of",
+            "json",
+            url,
+        ]
+    )
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=25,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if completed.returncode != 0:
+            return None, None
+        data = json.loads(completed.stdout or "{}")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None, None
+
+    video_candidates: list[tuple[int, int]] = []
+    audio_candidates: list[int] = []
+
+    for stream in data.get("streams", []):
+        try:
+            index = int(stream.get("index"))
+        except (TypeError, ValueError):
+            continue
+
+        codec_type = str(stream.get("codec_type") or "")
+        disposition = stream.get("disposition") or {}
+        attached_pic = bool(disposition.get("attached_pic"))
+
+        if codec_type == "video" and not attached_pic:
+            width = int(stream.get("width") or 0)
+            height = int(stream.get("height") or 0)
+            if width > 0 and height > 0:
+                video_candidates.append((width * height, index))
+        elif codec_type == "audio":
+            audio_candidates.append(index)
+
+    video_index = (
+        max(video_candidates, key=lambda item: item[0])[1]
+        if video_candidates
+        else None
+    )
+    audio_index = audio_candidates[0] if audio_candidates else None
+    return video_index, audio_index
+
+
 def _download_with_ffmpeg(
     url: str,
     destination: str,
@@ -773,71 +875,78 @@ def _download_with_ffmpeg(
             and hls_source
             and "not in allowed_segment_extensions" in stderr
         ):
-            sanitized_path: str | None = None
-            local_server: ThreadingHTTPServer | None = None
-            local_thread: threading.Thread | None = None
-            try:
-                sanitized_path, removed = _sanitize_hls_playlist(
-                    source_url,
-                    referer,
-                    user_agent,
-                    cookie_header,
-                    origin_header,
+            # This provider uses ".image" as the extension of the actual HLS
+            # media chunks. Keep them, but restrict the relaxation to HLS and
+            # explicitly choose a real video stream with valid dimensions.
+            video_index, audio_index = _probe_hls_stream_selection(
+                source_url,
+                referer,
+                user_agent,
+                cookie_header,
+                origin_header,
+            )
+
+            relaxed = list(command)
+            input_index = relaxed.index("-i")
+            relaxed[input_index:input_index] = [
+                "-analyzeduration",
+                "20000000",
+                "-probesize",
+                "20000000",
+                "-allowed_segment_extensions",
+                HLS_SEGMENT_EXTENSIONS,
+                "-extension_picky",
+                "0",
+            ]
+
+            # Replace the generic maps with stream-specific maps when ffprobe
+            # identified them. Upper-case V excludes attached pictures.
+            map_start = relaxed.index("-map", input_index)
+            output_path = relaxed[-1]
+            prefix = relaxed[:map_start]
+            maps: list[str] = []
+            if video_index is not None:
+                maps.extend(["-map", f"0:{video_index}"])
+            else:
+                maps.extend(["-map", "0:V:0?"])
+
+            if audio_index is not None:
+                maps.extend(["-map", f"0:{audio_index}"])
+            else:
+                maps.extend(["-map", "0:a:0?"])
+
+            relaxed = prefix + maps + [
+                "-sn",
+                "-dn",
+                "-c",
+                "copy",
+                output_path,
+            ]
+
+            temp_target.unlink(missing_ok=True)
+            if progress_details:
+                detail = (
+                    f"video={video_index if video_index is not None else 'auto'}, "
+                    f"audio={audio_index if audio_index is not None else 'auto'}"
+                )
+                progress_details(
+                    {
+                        "mode": "ffmpeg",
+                        "percent": -1,
+                        "bytes": None,
+                        "total_bytes": None,
+                        "speed_bps": None,
+                        "time_seconds": None,
+                        "duration_seconds": duration,
+                        "speed_factor": None,
+                        "message": (
+                            "HLS con segmentos .image detectado; "
+                            f"seleccionando pistas reales ({detail})."
+                        ),
+                    }
                 )
 
-                (
-                    local_server,
-                    local_thread,
-                    local_playlist_url,
-                ) = _serve_local_hls_playlist(sanitized_path)
-
-                sanitized = list(command)
-                input_index = sanitized.index("-i")
-                sanitized[input_index + 1] = local_playlist_url
-
-                # Keep FFmpeg on an HTTP input so protocol-specific options
-                # such as user_agent, referer and headers remain valid. The
-                # manifest itself is served only on localhost and all segment
-                # URLs inside it are absolute remote URLs.
-                sanitized[input_index:input_index] = [
-                    "-protocol_whitelist",
-                    "http,https,tcp,tls,crypto",
-                ]
-
-                temp_target.unlink(missing_ok=True)
-                if progress_details:
-                    progress_details(
-                        {
-                            "mode": "ffmpeg",
-                            "percent": -1,
-                            "bytes": None,
-                            "total_bytes": None,
-                            "speed_bps": None,
-                            "time_seconds": None,
-                            "duration_seconds": duration,
-                            "speed_factor": None,
-                            "message": (
-                                f"HLS saneado: {removed} recurso(s) "
-                                "no multimedia omitido(s)."
-                            ),
-                        }
-                    )
-
-                return_code, stderr = _run_ffmpeg(sanitized)
-            finally:
-                if local_server is not None:
-                    try:
-                        local_server.shutdown()
-                    except Exception:
-                        pass
-                    try:
-                        local_server.server_close()
-                    except Exception:
-                        pass
-                if local_thread is not None:
-                    local_thread.join(timeout=1.0)
-                if sanitized_path:
-                    Path(sanitized_path).unlink(missing_ok=True)
+            return_code, stderr = _run_ffmpeg(relaxed)
 
         if return_code != 0:
             message = stderr or "FFmpeg no pudo guardar la fuente."
