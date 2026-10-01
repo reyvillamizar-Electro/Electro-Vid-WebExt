@@ -150,6 +150,7 @@ class ManifestWorker(QObject):
 
 class DownloadWorker(QObject):
     progress = Signal(int)
+    details = Signal(object)
     finished = Signal(str)
     failed = Signal(str)
 
@@ -166,6 +167,7 @@ class DownloadWorker(QObject):
                 self.destination,
                 self.source.kind,
                 progress=self.progress.emit,
+                progress_details=self.details.emit,
                 referer=self.source.referer,
                 user_agent=self.source.user_agent,
                 cookie_header=self.source.cookie_header,
@@ -1181,6 +1183,7 @@ class MainWindow(QMainWindow):
         self._download_worker.moveToThread(self._download_thread)
         self._download_thread.started.connect(self._download_worker.run)
         self._download_worker.progress.connect(self._download_progress)
+        self._download_worker.details.connect(self._download_details)
         self._download_worker.finished.connect(self._download_finished)
         self._download_worker.failed.connect(self._download_failed)
         self._download_worker.finished.connect(self._download_thread.quit)
@@ -1229,13 +1232,80 @@ class MainWindow(QMainWindow):
             except OSError:
                 pass
 
+    @staticmethod
+    def _format_bytes(value: object) -> str:
+        if not isinstance(value, (int, float)) or value < 0:
+            return "—"
+        size = float(value)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024 or unit == "TB":
+                if unit == "B":
+                    return f"{int(size)} {unit}"
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return "—"
+
+    @staticmethod
+    def _format_rate(value: object) -> str:
+        if not isinstance(value, (int, float)) or value <= 0:
+            return "—"
+        return f"{MainWindow._format_bytes(value)}/s"
+
+    @Slot(object)
+    def _download_details(self, details: object) -> None:
+        if self._download_dialog is None or not isinstance(details, dict):
+            return
+
+        mode = str(details.get("mode") or "")
+        percent = details.get("percent")
+        current_bytes = details.get("bytes")
+        total_bytes = details.get("total_bytes")
+        time_seconds = details.get("time_seconds")
+        duration_seconds = details.get("duration_seconds")
+        speed_factor = details.get("speed_factor")
+        speed_bps = details.get("speed_bps")
+
+        lines: list[str] = []
+
+        if mode == "ffmpeg":
+            current_time = self._format_seconds(time_seconds)
+            total_time = (
+                self._format_seconds(duration_seconds)
+                if isinstance(duration_seconds, (int, float))
+                else "—"
+            )
+            lines.append(f"Tiempo: {current_time} / {total_time}")
+
+            if isinstance(speed_factor, (int, float)) and speed_factor > 0:
+                lines.append(f"Velocidad: {speed_factor:.2f}x")
+
+            if isinstance(current_bytes, (int, float)) and current_bytes >= 0:
+                lines.append(f"Tamaño: {self._format_bytes(current_bytes)}")
+
+        elif mode == "http":
+            current_size = self._format_bytes(current_bytes)
+            if isinstance(total_bytes, (int, float)) and total_bytes > 0:
+                lines.append(
+                    f"Descargado: {current_size} / {self._format_bytes(total_bytes)}"
+                )
+            else:
+                lines.append(f"Descargado: {current_size}")
+
+            if isinstance(speed_bps, (int, float)) and speed_bps > 0:
+                lines.append(f"Velocidad: {self._format_rate(speed_bps)}")
+
+        if isinstance(percent, int) and percent >= 0:
+            lines.insert(0, f"Progreso: {percent}%")
+
+        if lines:
+            self._download_dialog.setLabelText("\n".join(lines))
+
     @Slot(int)
     def _download_progress(self, value: int) -> None:
         if self._download_dialog is None:
             return
         if value < 0:
             self._download_dialog.setRange(0, 0)
-            self._download_dialog.setLabelText("Procesando stream con FFmpeg…")
         else:
             if self._download_dialog.maximum() == 0:
                 self._download_dialog.setRange(0, 100)
