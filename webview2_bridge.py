@@ -330,6 +330,229 @@ def choose_player_iframe(values: list[str]) -> str | None:
     )[0]
 
 
+def attach_native_content_guard(core, state: dict[str, object]) -> None:
+    if core is None or state.get("native_content_guard_installed"):
+        return
+
+    guard_script = r"""
+    (() => {
+      if (window.__ELECTRO_NATIVE_GUARD__) return;
+      window.__ELECTRO_NATIVE_GUARD__ = true;
+
+      const blockedHosts = ['dingerepilobe.com'];
+      const markers = [
+        'haz clic en permitir',
+        'si no eres un robot',
+        'e-captcha'
+      ];
+
+      const normalize = value =>
+        String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+      const hostBlocked = value => {
+        try {
+          const host = new URL(value, document.baseURI).hostname.toLowerCase();
+          return blockedHosts.some(
+            blocked => host === blocked || host.endsWith('.' + blocked)
+          );
+        } catch (_) {
+          return false;
+        }
+      };
+
+      const removeBlockedResources = root => {
+        try {
+          const scope =
+            root instanceof Element || root instanceof Document
+              ? root
+              : document;
+
+          scope.querySelectorAll?.('script[src], iframe[src], img[src]').forEach(el => {
+            const src = el.getAttribute('src') || '';
+            if (src && hostBlocked(src)) {
+              el.remove();
+            }
+          });
+        } catch (_) {}
+      };
+
+      const removeFakeCaptcha = root => {
+        try {
+          const scope =
+            root instanceof Element || root instanceof Document
+              ? root
+              : document;
+
+          const candidates = [];
+          if (scope instanceof Element) candidates.push(scope);
+
+          scope.querySelectorAll?.(
+            'div,section,aside,dialog,form,main,article'
+          ).forEach(el => candidates.push(el));
+
+          for (const el of candidates) {
+            const text = normalize(el.innerText || el.textContent || '');
+            if (!text) continue;
+
+            const hits = markers.filter(marker => text.includes(marker)).length;
+            if (hits < 2) continue;
+
+            let target = el;
+            for (let i = 0; i < 5 && target?.parentElement; i++) {
+              const parent = target.parentElement;
+              const style = getComputedStyle(parent);
+              const rect = parent.getBoundingClientRect();
+              const overlayLike =
+                style.position === 'fixed'
+                || style.position === 'absolute'
+                || Number(style.zIndex || 0) >= 100
+                || (
+                  rect.width >= innerWidth * 0.45
+                  && rect.height >= innerHeight * 0.35
+                );
+
+              if (overlayLike) {
+                target = parent;
+              } else {
+                break;
+              }
+            }
+
+            target?.remove();
+            document.documentElement.style.overflow = '';
+            if (document.body) document.body.style.overflow = '';
+            return true;
+          }
+        } catch (_) {}
+
+        return false;
+      };
+
+      const clean = root => {
+        removeBlockedResources(root);
+        removeFakeCaptcha(root);
+      };
+
+      const start = () => {
+        clean(document);
+
+        try {
+          const observer = new MutationObserver(records => {
+            for (const record of records) {
+              for (const node of record.addedNodes) {
+                if (node instanceof Element) clean(node);
+              }
+            }
+            removeFakeCaptcha(document);
+          });
+
+          observer.observe(document.documentElement || document, {
+            childList: true,
+            subtree: true
+          });
+        } catch (_) {}
+
+        // Some ad scripts rebuild the overlay repeatedly. Keep a lightweight
+        // guard active so it is removed even when inserted through timers.
+        setInterval(() => {
+          clean(document);
+        }, 400);
+      };
+
+      if (document.documentElement) {
+        start();
+      } else {
+        addEventListener('DOMContentLoaded', start, {once:true});
+      }
+    })();
+    """
+
+    try:
+        task = core.AddScriptToExecuteOnDocumentCreatedAsync(guard_script)
+        state["native_content_guard_task"] = task
+    except Exception as exc:
+        emit(
+            "diagnostic",
+            message=f"No se pudo instalar script preventivo en frames: {exc}",
+        )
+
+    def on_web_resource_requested(sender, args) -> None:
+        try:
+            uri = str(args.Request.Uri or "")
+        except Exception:
+            uri = ""
+
+        if not uri:
+            return
+
+        host = host_of(uri)
+        if not any(
+            host == blocked or host.endswith("." + blocked)
+            for blocked in BLOCKED_AD_HOSTS
+        ):
+            return
+
+        blocked = False
+        try:
+            from System.IO import MemoryStream
+            from System.Text import Encoding
+
+            stream = MemoryStream(Encoding.UTF8.GetBytes(""))
+            args.Response = core.Environment.CreateWebResourceResponse(
+                stream,
+                403,
+                "Blocked",
+                "Content-Type: text/plain",
+            )
+            blocked = True
+        except Exception:
+            pass
+
+        emit(
+            "navigation",
+            event="Recurso publicitario bloqueado",
+            from_url=str(state.get("current_url") or ""),
+            to=uri,
+            detail=(
+                "Petición cancelada por WebView2"
+                if blocked
+                else "Dominio publicitario detectado"
+            ),
+        )
+
+    try:
+        from Microsoft.Web.WebView2.Core import (
+            CoreWebView2WebResourceContext,
+            CoreWebView2WebResourceRequestSourceKinds,
+        )
+
+        try:
+            core.AddWebResourceRequestedFilter(
+                "*",
+                CoreWebView2WebResourceContext.All,
+                CoreWebView2WebResourceRequestSourceKinds.All,
+            )
+        except Exception:
+            core.AddWebResourceRequestedFilter(
+                "*",
+                CoreWebView2WebResourceContext.All,
+            )
+
+        core.WebResourceRequested += on_web_resource_requested
+        state["web_resource_handler"] = on_web_resource_requested
+    except Exception as exc:
+        emit(
+            "diagnostic",
+            message=f"No se pudo instalar filtro de recursos WebView2: {exc}",
+        )
+
+    state["native_content_guard_installed"] = True
+    emit(
+        "status",
+        message="Protección de anuncios y falsos CAPTCHA activa en todos los frames.",
+    )
+
+
 def attach_permission_handler(core, state: dict[str, object]) -> None:
     if core is None or state.get("permission_handler_installed"):
         return
@@ -406,6 +629,7 @@ def attach_popup_handler(core, state: dict[str, object]) -> None:
     if core is None:
         return
 
+    attach_native_content_guard(core, state)
     attach_permission_handler(core, state)
 
     if state.get("popup_handler_installed"):
@@ -564,6 +788,7 @@ def main() -> int:
         "popup_handler_installed": False,
         "popup_init_handler_installed": False,
         "permission_handler_installed": False,
+        "native_content_guard_installed": False,
         "navigation_handler_installed": False,
     }
 
