@@ -99,6 +99,149 @@ def media_report(window: webview.Window) -> list[str]:
     return result
 
 
+BLOCKED_AD_HOSTS = (
+    "dingerepilobe.com",
+)
+
+FAKE_CAPTCHA_MARKERS = (
+    "haz clic en permitir",
+    "si no eres un robot",
+    "e-captcha",
+)
+
+
+def install_content_guard(window: webview.Window) -> None:
+    script = r"""
+    (() => {
+      if (window.__ELECTRO_CONTENT_GUARD__) return;
+      window.__ELECTRO_CONTENT_GUARD__ = true;
+
+      const blockedHosts = [
+        'dingerepilobe.com'
+      ];
+
+      const fakeMarkers = [
+        'haz clic en permitir',
+        'si no eres un robot',
+        'e-captcha'
+      ];
+
+      const hostBlocked = value => {
+        try {
+          const host = new URL(value, document.baseURI).hostname.toLowerCase();
+          return blockedHosts.some(
+            blocked => host === blocked || host.endsWith('.' + blocked)
+          );
+        } catch (_) {
+          return false;
+        }
+      };
+
+      const looksLikeFakeCaptcha = node => {
+        if (!(node instanceof Element)) return false;
+
+        const text = String(node.innerText || node.textContent || '')
+          .toLowerCase()
+          .replace(/\s+/g, ' ')
+          .trim();
+
+        if (!text) return false;
+
+        const hits = fakeMarkers.filter(marker => text.includes(marker)).length;
+        if (hits < 2) return false;
+
+        const style = getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        const overlayLike =
+          style.position === 'fixed'
+          || style.position === 'absolute'
+          || Number(style.zIndex || 0) >= 1000
+          || (rect.width > innerWidth * 0.45 && rect.height > innerHeight * 0.35);
+
+        return overlayLike;
+      };
+
+      const clean = root => {
+        try {
+          const scope = root instanceof Element || root instanceof Document
+            ? root
+            : document;
+
+          scope.querySelectorAll?.('script[src], iframe[src]').forEach(el => {
+            const src = el.getAttribute('src') || '';
+            if (src && hostBlocked(src)) {
+              el.remove();
+            }
+          });
+
+          const nodes = [];
+          if (scope instanceof Element) nodes.push(scope);
+          scope.querySelectorAll?.('div,section,aside,dialog').forEach(
+            el => nodes.push(el)
+          );
+
+          for (const node of nodes) {
+            if (looksLikeFakeCaptcha(node)) {
+              node.remove();
+              break;
+            }
+          }
+
+          document.documentElement.style.overflow = '';
+          document.body && (document.body.style.overflow = '');
+        } catch (_) {}
+      };
+
+      clean(document);
+
+      const observer = new MutationObserver(records => {
+        for (const record of records) {
+          for (const node of record.addedNodes) {
+            if (node instanceof Element) {
+              if (
+                (node.matches('script[src], iframe[src]'))
+                && hostBlocked(node.getAttribute('src') || '')
+              ) {
+                node.remove();
+                continue;
+              }
+              clean(node);
+            }
+          }
+        }
+      });
+
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true
+      });
+
+      const originalCreateElement = document.createElement.bind(document);
+      document.createElement = function(name, options) {
+        const el = originalCreateElement(name, options);
+        if (String(name).toLowerCase() === 'script') {
+          const originalSetAttribute = el.setAttribute.bind(el);
+          el.setAttribute = function(attr, value) {
+            if (
+              String(attr).toLowerCase() === 'src'
+              && hostBlocked(String(value || ''))
+            ) {
+              return;
+            }
+            return originalSetAttribute(attr, value);
+          };
+        }
+        return el;
+      };
+    })();
+    """
+
+    try:
+        window.evaluate_js(script)
+    except Exception:
+        pass
+
+
 def emit_media_snapshot(window: webview.Window, state: dict[str, object]) -> None:
     current = str(state.get("current_url") or "")
     user_agent = str(state.get("user_agent") or "")
@@ -436,6 +579,7 @@ def main() -> int:
     def on_before_show() -> None:
         install_navigation_guard(window, state)
         install_popup_handler(window, state)
+        install_content_guard(window)
         emit("ready", url=initial_url)
 
     def on_loaded() -> None:
@@ -457,6 +601,8 @@ def main() -> int:
 
         if not state.get("popup_handler_installed"):
             install_popup_handler(window, state)
+
+        install_content_guard(window)
 
         try:
             ua = window.evaluate_js("navigator.userAgent")
