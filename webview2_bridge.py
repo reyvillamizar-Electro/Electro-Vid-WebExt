@@ -180,15 +180,60 @@ def install_content_guard(window: webview.Window) -> None:
             el => nodes.push(el)
           );
 
+          let fakeCaptchaRemoved = false;
           for (const node of nodes) {
             if (looksLikeFakeCaptcha(node)) {
               node.remove();
+              fakeCaptchaRemoved = true;
               break;
             }
           }
 
-          document.documentElement.style.overflow = '';
-          document.body && (document.body.style.overflow = '');
+          if (fakeCaptchaRemoved) {
+            const clearBlockingLayers = () => {
+              try {
+                document.querySelectorAll(
+                  'div,section,aside,dialog,form'
+                ).forEach(el => {
+                  if (!(el instanceof Element)) return;
+                  if (el.querySelector('video,canvas')) return;
+
+                  const style = getComputedStyle(el);
+                  const rect = el.getBoundingClientRect();
+                  const coversViewport =
+                    rect.width >= innerWidth * 0.75
+                    && rect.height >= innerHeight * 0.75;
+                  const floating =
+                    style.position === 'fixed'
+                    || style.position === 'absolute';
+                  const highLayer = Number(style.zIndex || 0) >= 10;
+                  const text = String(
+                    el.innerText || el.textContent || ''
+                  ).trim();
+
+                  if (
+                    coversViewport
+                    && floating
+                    && highLayer
+                    && text.length < 80
+                  ) {
+                    el.remove();
+                  }
+                });
+
+                document.documentElement.style.overflow = '';
+                document.documentElement.style.pointerEvents = '';
+                if (document.body) {
+                  document.body.style.overflow = '';
+                  document.body.style.pointerEvents = '';
+                }
+              } catch (_) {}
+            };
+
+            clearBlockingLayers();
+            setTimeout(clearBlockingLayers, 50);
+            setTimeout(clearBlockingLayers, 250);
+          }
         } catch (_) {}
       };
 
@@ -419,8 +464,50 @@ def attach_native_content_guard(core, state: dict[str, object]) -> None:
             }
 
             target?.remove();
-            document.documentElement.style.overflow = '';
-            if (document.body) document.body.style.overflow = '';
+
+            const clearBlockingLayers = () => {
+              try {
+                document.querySelectorAll(
+                  'div,section,aside,dialog,form'
+                ).forEach(layer => {
+                  if (!(layer instanceof Element)) return;
+                  if (layer.querySelector('video,canvas')) return;
+
+                  const layerStyle = getComputedStyle(layer);
+                  const layerRect = layer.getBoundingClientRect();
+                  const coversViewport =
+                    layerRect.width >= innerWidth * 0.75
+                    && layerRect.height >= innerHeight * 0.75;
+                  const floating =
+                    layerStyle.position === 'fixed'
+                    || layerStyle.position === 'absolute';
+                  const highLayer = Number(layerStyle.zIndex || 0) >= 10;
+                  const layerText = normalize(
+                    layer.innerText || layer.textContent || ''
+                  );
+
+                  if (
+                    coversViewport
+                    && floating
+                    && highLayer
+                    && layerText.length < 80
+                  ) {
+                    layer.remove();
+                  }
+                });
+
+                document.documentElement.style.overflow = '';
+                document.documentElement.style.pointerEvents = '';
+                if (document.body) {
+                  document.body.style.overflow = '';
+                  document.body.style.pointerEvents = '';
+                }
+              } catch (_) {}
+            };
+
+            clearBlockingLayers();
+            setTimeout(clearBlockingLayers, 50);
+            setTimeout(clearBlockingLayers, 250);
             return true;
           }
         } catch (_) {}
