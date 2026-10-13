@@ -187,8 +187,85 @@ def choose_player_iframe(values: list[str]) -> str | None:
     )[0]
 
 
+def attach_permission_handler(core, state: dict[str, object]) -> None:
+    if core is None or state.get("permission_handler_installed"):
+        return
+
+    def on_permission_requested(sender, args) -> None:
+        try:
+            uri = str(args.Uri or "")
+        except Exception:
+            uri = ""
+
+        try:
+            kind = str(args.PermissionKind)
+        except Exception:
+            kind = "Unknown"
+
+        denied = False
+
+        try:
+            current_state = args.State
+            state_type = type(current_state)
+            deny_value = getattr(state_type, "Deny", None)
+            if deny_value is not None:
+                args.State = deny_value
+                denied = True
+        except Exception:
+            pass
+
+        if not denied:
+            try:
+                from Microsoft.Web.WebView2.Core import CoreWebView2PermissionState
+
+                args.State = CoreWebView2PermissionState.Deny
+                denied = True
+            except Exception:
+                pass
+
+        try:
+            if hasattr(args, "SavesInProfile"):
+                args.SavesInProfile = False
+        except Exception:
+            pass
+
+        try:
+            if hasattr(args, "Handled"):
+                args.Handled = True
+        except Exception:
+            pass
+
+        emit(
+            "navigation",
+            event="Permiso bloqueado",
+            from_url=str(state.get("current_url") or ""),
+            to=uri,
+            detail=(
+                f"{kind} · denegado por WebView2"
+                if denied
+                else f"{kind} · intento de permiso interceptado"
+            ),
+        )
+
+    try:
+        core.PermissionRequested += on_permission_requested
+        state["permission_handler_installed"] = True
+        state["permission_handler"] = on_permission_requested
+        emit("status", message="Protección de permisos WebView2 activa.")
+    except Exception as exc:
+        emit(
+            "diagnostic",
+            message=f"No se pudo instalar PermissionRequested: {exc}",
+        )
+
+
 def attach_popup_handler(core, state: dict[str, object]) -> None:
-    if core is None or state.get("popup_handler_installed"):
+    if core is None:
+        return
+
+    attach_permission_handler(core, state)
+
+    if state.get("popup_handler_installed"):
         return
 
     def on_new_window_requested(sender, args) -> None:
@@ -343,6 +420,7 @@ def main() -> int:
         "player_depth": 0,
         "popup_handler_installed": False,
         "popup_init_handler_installed": False,
+        "permission_handler_installed": False,
         "navigation_handler_installed": False,
     }
 
