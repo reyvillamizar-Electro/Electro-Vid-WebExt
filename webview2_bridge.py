@@ -261,23 +261,6 @@ def install_content_guard(window: webview.Window) -> None:
         subtree: true
       });
 
-      const originalCreateElement = document.createElement.bind(document);
-      document.createElement = function(name, options) {
-        const el = originalCreateElement(name, options);
-        if (String(name).toLowerCase() === 'script') {
-          const originalSetAttribute = el.setAttribute.bind(el);
-          el.setAttribute = function(attr, value) {
-            if (
-              String(attr).toLowerCase() === 'src'
-              && hostBlocked(String(value || ''))
-            ) {
-              return;
-            }
-            return originalSetAttribute(attr, value);
-          };
-        }
-        return el;
-      };
     })();
     """
 
@@ -515,9 +498,63 @@ def attach_native_content_guard(core, state: dict[str, object]) -> None:
         return false;
       };
 
+      const removeInvisibleClickBlockers = () => {
+        try {
+          const candidates = document.querySelectorAll(
+            'div,section,aside,form,a,span'
+          );
+
+          for (const el of candidates) {
+            if (!(el instanceof Element)) continue;
+            if (el === document.body || el === document.documentElement) continue;
+            if (el.querySelector('video,canvas')) continue;
+
+            const style = getComputedStyle(el);
+            if (style.pointerEvents === 'none') continue;
+
+            const rect = el.getBoundingClientRect();
+            const coversViewport =
+              rect.width >= innerWidth * 0.85
+              && rect.height >= innerHeight * 0.85;
+            if (!coversViewport) continue;
+
+            const floating =
+              style.position === 'fixed'
+              || style.position === 'absolute';
+            if (!floating) continue;
+
+            const z = Number.parseInt(style.zIndex || '0', 10);
+            if (!Number.isFinite(z) || z < 50) continue;
+
+            const text = normalize(el.innerText || el.textContent || '');
+            if (text.length > 8) continue;
+
+            const opacity = Number.parseFloat(style.opacity || '1');
+            const bg = String(style.backgroundColor || '').toLowerCase();
+            const transparentBackground =
+              bg === 'transparent'
+              || bg === 'rgba(0, 0, 0, 0)'
+              || bg.endsWith(', 0)');
+
+            const visuallyInvisible =
+              opacity <= 0.05
+              || (
+                transparentBackground
+                && !el.querySelector('img,svg,iframe,button,input,select,textarea')
+              );
+
+            if (!visuallyInvisible) continue;
+
+            el.style.pointerEvents = 'none';
+            el.setAttribute('data-electro-click-blocker-disabled', 'true');
+          }
+        } catch (_) {}
+      };
+
       const clean = root => {
         removeBlockedResources(root);
         removeFakeCaptcha(root);
+        removeInvisibleClickBlockers();
       };
 
       const start = () => {
@@ -541,9 +578,19 @@ def attach_native_content_guard(core, state: dict[str, object]) -> None:
 
         // Some ad scripts rebuild the overlay repeatedly. Keep a lightweight
         // guard active so it is removed even when inserted through timers.
-        setInterval(() => {
+        const watchdog = () => {
           clean(document);
-        }, 400);
+        };
+
+        setInterval(watchdog, 500);
+        addEventListener('scroll', () => {
+          setTimeout(watchdog, 0);
+          setTimeout(watchdog, 120);
+        }, {passive:true});
+        addEventListener('wheel', () => {
+          setTimeout(watchdog, 0);
+          setTimeout(watchdog, 120);
+        }, {passive:true});
       };
 
       if (document.documentElement) {
