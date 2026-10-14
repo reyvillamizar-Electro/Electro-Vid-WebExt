@@ -161,6 +161,66 @@ def install_content_guard(window: webview.Window) -> None:
         return overlayLike;
       };
 
+      const removeFloatingAds = () => {
+        try {
+          document.querySelectorAll(
+            'div,aside,section,iframe,video,img'
+          ).forEach(el => {
+            if (!(el instanceof Element)) return;
+
+            let target = el;
+            for (let i = 0; i < 4 && target?.parentElement; i++) {
+              const parent = target.parentElement;
+              const ps = getComputedStyle(parent);
+              if (ps.position === 'fixed' || ps.position === 'sticky') {
+                target = parent;
+                break;
+              }
+              target = parent;
+            }
+
+            if (!(target instanceof Element)) return;
+
+            const style = getComputedStyle(target);
+            if (
+              style.position !== 'fixed'
+              && style.position !== 'sticky'
+            ) return;
+
+            const rect = target.getBoundingClientRect();
+            if (rect.width < 180 || rect.height < 120) return;
+
+            const ratio =
+              (rect.width * rect.height)
+              / Math.max(1, innerWidth * innerHeight);
+            if (ratio < 0.05 || ratio > 0.45) return;
+
+            const z = Number.parseInt(style.zIndex || '0', 10);
+            if (!Number.isFinite(z) || z < 20) return;
+
+            const nearEdge =
+              rect.right >= innerWidth - 24
+              || rect.left <= 24
+              || rect.top <= 24
+              || rect.bottom >= innerHeight - 24;
+            if (!nearEdge) return;
+
+            const containsMedia = Boolean(
+              target.matches('iframe,video,img')
+              || target.querySelector('iframe,video,img')
+            );
+            if (!containsMedia) return;
+
+            const largeMainPlayer =
+              rect.width >= innerWidth * 0.60
+              && rect.height >= innerHeight * 0.55;
+            if (largeMainPlayer) return;
+
+            target.remove();
+          });
+        } catch (_) {}
+      };
+
       const clean = root => {
         try {
           const scope = root instanceof Element || root instanceof Document
@@ -188,6 +248,8 @@ def install_content_guard(window: webview.Window) -> None:
               break;
             }
           }
+
+          removeFloatingAds();
 
           if (fakeCaptchaRemoved) {
             const clearBlockingLayers = () => {
@@ -498,6 +560,92 @@ def attach_native_content_guard(core, state: dict[str, object]) -> None:
         return false;
       };
 
+      const removeFloatingAds = () => {
+        try {
+          const candidates = document.querySelectorAll(
+            'div,aside,section,iframe,video,img'
+          );
+
+          for (const el of candidates) {
+            if (!(el instanceof Element)) continue;
+            if (el === document.body || el === document.documentElement) continue;
+
+            let target = el;
+            for (let i = 0; i < 4 && target?.parentElement; i++) {
+              const parent = target.parentElement;
+              const parentStyle = getComputedStyle(parent);
+              if (
+                parentStyle.position === 'fixed'
+                || parentStyle.position === 'sticky'
+              ) {
+                target = parent;
+                break;
+              }
+              target = parent;
+            }
+
+            if (!(target instanceof Element)) continue;
+            if (target.querySelector('#front-player')) continue;
+
+            const style = getComputedStyle(target);
+            if (
+              style.position !== 'fixed'
+              && style.position !== 'sticky'
+            ) {
+              continue;
+            }
+
+            const rect = target.getBoundingClientRect();
+            if (rect.width < 180 || rect.height < 120) continue;
+
+            const viewportArea = Math.max(1, innerWidth * innerHeight);
+            const areaRatio = (rect.width * rect.height) / viewportArea;
+
+            // Typical floating-ad footprint: substantial enough to be an ad,
+            // but not large enough to be the main player/fullscreen content.
+            if (areaRatio < 0.05 || areaRatio > 0.45) continue;
+
+            const z = Number.parseInt(style.zIndex || '0', 10);
+            if (!Number.isFinite(z) || z < 20) continue;
+
+            const nearEdge =
+              rect.right >= innerWidth - 24
+              || rect.left <= 24
+              || rect.top <= 24
+              || rect.bottom >= innerHeight - 24;
+            if (!nearEdge) continue;
+
+            const containsMedia = Boolean(
+              target.matches('iframe,video,img')
+              || target.querySelector('iframe,video,img')
+            );
+            if (!containsMedia) continue;
+
+            // Avoid touching a real main player occupying most of the viewport.
+            const largeMainPlayer =
+              rect.width >= innerWidth * 0.60
+              && rect.height >= innerHeight * 0.55;
+            if (largeMainPlayer) continue;
+
+            const text = normalize(
+              target.innerText || target.textContent || ''
+            );
+            const hasAdLikeControl = Boolean(
+              target.querySelector(
+                '[aria-label*="close" i], [title*="close" i], ' +
+                '[aria-label*="cerrar" i], [title*="cerrar" i], ' +
+                'button, [role="button"]'
+              )
+            );
+
+            if (text.length <= 140 || hasAdLikeControl) {
+              target.remove();
+            }
+          }
+        } catch (_) {}
+      };
+
+
       const removeInvisibleClickBlockers = () => {
         try {
           const candidates = document.querySelectorAll(
@@ -554,6 +702,7 @@ def attach_native_content_guard(core, state: dict[str, object]) -> None:
       const clean = root => {
         removeBlockedResources(root);
         removeFakeCaptcha(root);
+        removeFloatingAds();
         removeInvisibleClickBlockers();
       };
 
