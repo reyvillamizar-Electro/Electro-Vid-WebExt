@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -10,6 +11,11 @@ from yt_dlp import YoutubeDL
 from yt_dlp.extractor import gen_extractor_classes
 
 from electro_vid_webext.core.detector import VideoSource
+from electro_vid_webext.core.downloader import (
+    prepare_video_for_publish,
+    validate_download,
+)
+from electro_vid_webext.core.metadata import _codec_label, _format_duration, _format_size
 
 
 ProgressCallback = Callable[[int], None]
@@ -119,7 +125,7 @@ def extract_specialized_sources(url: str) -> tuple[ExtractorMatch, list[VideoSou
     )
 
     # Keep one practical candidate per vertical resolution. Prefer formats with
-    # audio already included, then MP4, then the highest bitrate.
+    # audio already included, then MP4/H.264, then the highest bitrate.
     by_height: dict[int, dict] = {}
     for fmt in video_formats:
         height = int(fmt.get("height") or 0)
@@ -139,6 +145,7 @@ def extract_specialized_sources(url: str) -> tuple[ExtractorMatch, list[VideoSou
     title = str(info.get("title") or "Video")
     webpage_url = str(info.get("webpage_url") or url)
     extractor_key = str(info.get("extractor_key") or match.key)
+    video_duration = _positive_number(info.get("duration"))
 
     sources: list[VideoSource] = []
     for fmt in selected:
@@ -151,6 +158,25 @@ def extract_specialized_sources(url: str) -> tuple[ExtractorMatch, list[VideoSou
         height = int(fmt.get("height") or 0)
         ext = str(fmt.get("ext") or "mp4").upper()
         has_audio = str(fmt.get("acodec") or "none").lower() != "none"
+        duration = _positive_number(fmt.get("duration")) or video_duration
+        exact_size = _positive_number(fmt.get("filesize"))
+        approximate_size = _positive_number(fmt.get("filesize_approx"))
+        if not approximate_size and duration:
+            bitrate = _positive_number(fmt.get("tbr"))
+            if bitrate:
+                approximate_size = duration * bitrate * 1000 / 8
+        if not has_audio:
+            audio_size = (
+                _positive_number(best_audio.get("filesize"))
+                or _positive_number(best_audio.get("filesize_approx"))
+                if best_audio else None
+            )
+            approximate_size = (exact_size or approximate_size or 0) + (audio_size or 0)
+            exact_size = None
+        size_hint = (
+            _format_size(int(exact_size)) if exact_size else
+            f"≈ {_format_size(int(approximate_size))}" if approximate_size else "—"
+        )
 
         headers = fmt.get("http_headers") if isinstance(fmt.get("http_headers"), dict) else {}
         user_agent = str(headers.get("User-Agent") or "") or None
@@ -186,6 +212,9 @@ def extract_specialized_sources(url: str) -> tuple[ExtractorMatch, list[VideoSou
                 origin_header=origin_header,
                 quality_hint=_quality_label(height),
                 resolution_hint=f"{width}×{height}" if width and height else "—",
+                duration_hint=_format_duration(duration),
+                codec_hint=_codec_label(str(fmt.get("vcodec") or info.get("vcodec") or "")),
+                size_hint=size_hint,
                 protection="—",
                 backend="yt-dlp",
                 extractor_key=extractor_key,
@@ -201,6 +230,14 @@ def extract_specialized_sources(url: str) -> tuple[ExtractorMatch, list[VideoSou
         raise RuntimeError("yt-dlp encontró el video, pero no formatos utilizables.")
 
     return match, sources
+
+
+def _positive_number(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
 
 
 def download_specialized(
@@ -267,7 +304,9 @@ def download_specialized(
 
         try:
             with YoutubeDL(options) as ydl:
-                ydl.download([source.webpage_url])
+                result_code = ydl.download([source.webpage_url])
+            if result_code != 0:
+                raise RuntimeError(f"yt-dlp terminó con código {result_code}.")
         except SpecializedDownloadCancelled:
             raise
         except Exception as exc:
@@ -284,23 +323,35 @@ def download_specialized(
             raise RuntimeError("yt-dlp terminó, pero no produjo un archivo final.")
 
         result = max(candidates, key=lambda path: path.stat().st_size)
-        if result.stat().st_size <= 0:
-            raise RuntimeError("yt-dlp produjo un archivo vacío.")
-
-        if target.exists():
-            target.unlink()
-        shutil.move(str(result), str(target))
+        validate_download(result)
+        if result.suffix.lower() != target.suffix.lower():
+            raise RuntimeError(
+                f"yt-dlp produjo {result.suffix or 'un archivo sin extensión'}, "
+                f"pero el destino elegido termina en {target.suffix or 'ninguna extensión'}. "
+                "Selecciona un formato y nombre compatibles para evitar un video mal etiquetado."
+            )
+        ready = prepare_video_for_publish(
+            result,
+            cancelled=cancelled,
+            cancelled_error=SpecializedDownloadCancelled,
+            progress=progress,
+            progress_details=progress_details,
+        )
+        if cancelled and cancelled():
+            raise SpecializedDownloadCancelled("Descarga cancelada.")
+        ready.replace(target)
 
         if progress:
             progress(100)
 
 
-def _format_score(fmt: dict) -> tuple[int, int, float, int]:
+def _format_score(fmt: dict) -> tuple[int, int, int, float, int]:
     has_audio = int(str(fmt.get("acodec") or "none").lower() != "none")
     is_mp4 = int(str(fmt.get("ext") or "").lower() == "mp4")
+    is_h264 = int(str(fmt.get("vcodec") or "").lower().startswith(("avc1", "h264")))
     bitrate = float(fmt.get("tbr") or fmt.get("vbr") or 0)
     size = int(fmt.get("filesize") or fmt.get("filesize_approx") or 0)
-    return has_audio, is_mp4, bitrate, size
+    return has_audio, is_mp4, is_h264, bitrate, size
 
 
 def _quality_label(height: int) -> str:

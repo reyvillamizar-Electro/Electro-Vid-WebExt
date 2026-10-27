@@ -63,6 +63,8 @@ Para MP4, WebM, MOV y M4V accesibles directamente, la aplicación descarga el ar
 
 Para HLS y DASH utiliza FFmpeg con copia de streams cuando es posible.
 
+Cada intento se guarda en una carpeta temporal única junto al destino. El nombre final se publica solo después de completar la transferencia y validar que contiene video; las descargas HTTP también deben coincidir con `Content-Length` cuando el servidor lo informa. Las descargas de yt-dlp se validan del mismo modo. Al reemplazar un nombre existente, un fallo de validación o un archivo bloqueado conserva la versión anterior. FFprobe es necesario para esta validación.
+
 La disponibilidad de descarga depende de cómo el servidor publique la fuente. Durante descargas con FFmpeg se muestra el tiempo procesado, duración total cuando puede determinarse, tamaño generado, velocidad relativa y porcentaje. Las descargas HTTP muestran bytes descargados, tamaño total cuando el servidor lo informa, velocidad y porcentaje. La ventana de progreso permite cancelar la descarga; al cancelar, se elimina únicamente el archivo temporal asociado a ese intento y no se tocan descargas anteriores. La aplicación no intenta eludir DRM ni controles de acceso.
 
 ## Requisitos
@@ -122,6 +124,10 @@ Electro Vid-WebExt puede usar dos estrategias de extracción:
 - **yt-dlp · especializado**: fuerza el backend especializado para sitios compatibles.
 
 Cuando yt-dlp reconoce una plataforma, la aplicación muestra distintas calidades como fuentes seleccionables. Las descargas conservan el `format_id` seleccionado; si el video y el audio vienen separados, yt-dlp y FFmpeg los combinan al guardar.
+
+Las filas de yt-dlp muestran duración, códec y tamaño a partir de la información del extractor, sin volver a consultar las URL temporales del video. Cuando el tamaño es aproximado se indica con `≈`; si la plataforma no informa un dato, se muestra `—`.
+
+Antes de publicar un MP4, la aplicación comprueba su códec. Si el video descargado usa HEVC/H.265, lo convierte en la carpeta temporal a H.264 para que Windows pueda generar su miniatura con mayor facilidad. La conversión puede tardar y aumentar el tamaño del archivo. Si falla o se cancela, el archivo final anterior se conserva y el temporal se elimina. Los MP4 que ya usan H.264 no se recomprimen.
 
 El backend especializado se integra mediante la API Python de yt-dlp. Algunos sitios pueden cambiar sus mecanismos de reproducción, firmas o tokens, por lo que mantener yt-dlp actualizado ayuda a conservar compatibilidad.
 

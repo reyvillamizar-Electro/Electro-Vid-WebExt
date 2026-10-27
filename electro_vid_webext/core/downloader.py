@@ -449,22 +449,21 @@ def _serve_local_hls_playlist(
     return server, thread, f"http://127.0.0.1:{port}/playlist.m3u8"
 
 
-def temporary_download_path(destination: str) -> Path:
-    target = Path(destination)
-    suffix = target.suffix or ".mp4"
-    return target.with_name(f"{target.stem}.part{suffix}")
-
-
-def _temporary_target(destination: str) -> Path:
-    return temporary_download_path(destination)
-
-
-def _validate_download(path: Path, content_type: str = "") -> None:
+def validate_download(
+    path: Path,
+    content_type: str = "",
+    expected_bytes: int | None = None,
+) -> None:
     if not path.exists():
         raise RuntimeError("El servidor no creó ningún archivo.")
 
-    if path.stat().st_size <= 0:
+    size = path.stat().st_size
+    if size <= 0:
         raise RuntimeError("El servidor devolvió un archivo vacío.")
+    if expected_bytes is not None and size != expected_bytes:
+        raise RuntimeError(
+            f"Descarga incompleta: se esperaban {expected_bytes} bytes y llegaron {size}."
+        )
 
     normalized = content_type.lower().split(";", 1)[0].strip()
     if any(normalized.startswith(value) for value in BAD_CONTENT_TYPES):
@@ -474,26 +473,32 @@ def _validate_download(path: Path, content_type: str = "") -> None:
 
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
-        return
+        raise RuntimeError("FFprobe no está disponible para validar el video.")
 
-    completed = subprocess.run(
-        [
-            ffprobe,
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_type",
-            "-of",
-            "json",
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("FFprobe agotó el tiempo de validación del video.") from exc
+    except OSError as exc:
+        raise RuntimeError(f"No se pudo ejecutar FFprobe: {exc}") from exc
     if completed.returncode != 0:
         raise RuntimeError("El archivo recibido no es un video válido según FFprobe.")
 
@@ -504,6 +509,85 @@ def _validate_download(path: Path, content_type: str = "") -> None:
 
     if not data.get("streams"):
         raise RuntimeError("El archivo descargado no contiene una pista de video.")
+
+
+def prepare_video_for_publish(
+    path: Path,
+    *,
+    cancelled: CancelCallback | None = None,
+    cancelled_error: type[RuntimeError] = DownloadCancelled,
+    progress: ProgressCallback | None = None,
+    progress_details: ProgressDetailsCallback | None = None,
+) -> Path:
+    """Convert HEVC MP4 in staging so Explorer receives a compatible final file."""
+    if path.suffix.lower() != ".mp4":
+        return path
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("FFprobe no está disponible para comprobar el códec del video.")
+    try:
+        probe = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=codec_name", "-of", "json", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        streams = json.loads(probe.stdout or "{}").get("streams") or []
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"No se pudo comprobar el códec del video: {exc}") from exc
+    if probe.returncode != 0 or not streams:
+        raise RuntimeError("FFprobe no pudo identificar el códec del video.")
+    if str(streams[0].get("codec_name") or "").lower() != "hevc":
+        return path
+
+    if cancelled and cancelled():
+        raise cancelled_error("Descarga cancelada.")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg no está disponible para convertir HEVC a H.264.")
+    if progress:
+        progress(-1)
+    if progress_details:
+        progress_details({"mode": "ffmpeg", "percent": -1,
+                          "message": "Convirtiendo HEVC a H.264 antes de guardar..."})
+
+    converted = path.with_name("normalized-h264.mp4")
+    command = [
+        ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-xerror",
+        "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a?",
+        "-sn", "-dn", "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
+        str(converted),
+    ]
+    try:
+        process = subprocess.Popen(
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        while True:
+            try:
+                _, stderr = process.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                if cancelled and cancelled():
+                    process.kill()
+                    process.communicate()
+                    raise cancelled_error("Descarga cancelada.")
+    except OSError as exc:
+        raise RuntimeError(f"No se pudo convertir HEVC a H.264: {exc}") from exc
+    if process.returncode != 0:
+        raise RuntimeError(
+            "No se pudo convertir HEVC a H.264: "
+            + (stderr or "FFmpeg terminó con un error.").strip()
+        )
+    if cancelled and cancelled():
+        raise cancelled_error("Descarga cancelada.")
+    validate_download(converted)
+    return converted
 
 
 def _download_direct(
@@ -518,18 +602,21 @@ def _download_direct(
     cancelled: CancelCallback | None,
 ) -> None:
     target = Path(destination)
-    temp_target = _temporary_target(destination)
     target.parent.mkdir(parents=True, exist_ok=True)
-    temp_target.unlink(missing_ok=True)
-
     request = Request(
         url,
         headers=_headers(referer, user_agent, cookie_header, origin_header),
     )
+    staging = tempfile.TemporaryDirectory(
+        prefix=".electro-vid-webext-", dir=str(target.parent)
+    )
+    temp_target = Path(staging.name) / f"download{target.suffix or '.mp4'}"
 
     try:
         with urlopen(request, timeout=30) as response:
             status = getattr(response, "status", 200)
+            if status == 206:
+                raise RuntimeError("El servidor entregó solo una parte del video (HTTP 206).")
             if status >= 400:
                 raise RuntimeError(f"El servidor respondió HTTP {status}.")
 
@@ -569,13 +656,22 @@ def _download_direct(
                             }
                         )
 
-        _validate_download(temp_target, content_type)
-        temp_target.replace(target)
+        if total > 0 and received != total:
+            raise RuntimeError(
+                f"Descarga incompleta: se esperaban {total} bytes y llegaron {received}."
+            )
+        validate_download(temp_target, content_type, total or None)
+        ready = prepare_video_for_publish(
+            temp_target, cancelled=cancelled, progress=progress,
+            progress_details=progress_details,
+        )
+        if cancelled and cancelled():
+            raise DownloadCancelled("Descarga cancelada.")
+        ready.replace(target)
         if progress:
             progress(100)
-    except Exception:
-        temp_target.unlink(missing_ok=True)
-        raise
+    finally:
+        staging.cleanup()
 
 
 def _probe_hls_stream_selection(
@@ -690,10 +786,7 @@ def _download_with_ffmpeg(
         raise RuntimeError("FFmpeg no está disponible en el PATH.")
 
     target = Path(destination)
-    temp_target = _temporary_target(destination)
     target.parent.mkdir(parents=True, exist_ok=True)
-    temp_target.unlink(missing_ok=True)
-
     source_url = _select_best_hls_variant(
         url,
         referer,
@@ -743,6 +836,10 @@ def _download_with_ffmpeg(
         command.extend(["-headers", "\r\n".join(extra_headers) + "\r\n"])
 
     hls_source = urlparse(source_url).path.lower().endswith((".m3u8", ".m3u"))
+    staging = tempfile.TemporaryDirectory(
+        prefix=".electro-vid-webext-", dir=str(target.parent)
+    )
+    temp_target = Path(staging.name) / f"download{target.suffix or '.mp4'}"
 
     command.extend(
         [
@@ -1079,10 +1176,15 @@ def _download_with_ffmpeg(
             message = stderr or "FFmpeg no pudo guardar la fuente."
             raise RuntimeError(message)
 
-        _validate_download(temp_target)
-        temp_target.replace(target)
+        validate_download(temp_target)
+        ready = prepare_video_for_publish(
+            temp_target, cancelled=cancelled, progress=progress,
+            progress_details=progress_details,
+        )
+        if cancelled and cancelled():
+            raise DownloadCancelled("Descarga cancelada.")
+        ready.replace(target)
         if progress:
             progress(100)
-    except Exception:
-        temp_target.unlink(missing_ok=True)
-        raise
+    finally:
+        staging.cleanup()

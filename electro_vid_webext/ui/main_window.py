@@ -39,7 +39,6 @@ from electro_vid_webext.core.downloader import (
     DownloadCancelled,
     download_media,
     suggested_extension,
-    temporary_download_path,
 )
 from electro_vid_webext.core.manifest import inspect_manifest
 from electro_vid_webext.core.metadata import MediaMetadata, ffprobe_available, read_media_metadata
@@ -104,12 +103,8 @@ class MetadataWorker(QObject):
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="metadata") as executor:
             future_by_url = {
                 executor.submit(
-                    read_media_metadata,
-                    source.url,
-                    referer=source.referer,
-                    user_agent=source.user_agent,
-                    cookie_header=source.cookie_header,
-                    origin_header=source.origin_header,
+                    self._read_source,
+                    source,
                 ): source.url
                 for source in self.sources
             }
@@ -127,6 +122,24 @@ class MetadataWorker(QObject):
                 self.progress.emit(completed, total)
 
         self.finished.emit()
+
+    @staticmethod
+    def _read_source(source: VideoSource) -> MediaMetadata:
+        if source.backend == "yt-dlp":
+            return MediaMetadata(
+                duration=source.duration_hint,
+                quality=source.quality_hint,
+                resolution=source.resolution_hint,
+                codec=source.codec_hint,
+                size=source.size_hint,
+            )
+        return read_media_metadata(
+            source.url,
+            referer=source.referer,
+            user_agent=source.user_agent,
+            cookie_header=source.cookie_header,
+            origin_header=source.origin_header,
+        )
 
 
 class ManifestWorker(QObject):
@@ -282,8 +295,6 @@ class MainWindow(QMainWindow):
         self._download_worker: DownloadWorker | None = None
         self._download_dialog: QProgressDialog | None = None
         self._download_destination: str | None = None
-        self._download_temp_path: Path | None = None
-        self._download_destination_existed_before = False
         self._download_cancel_requested = False
         self._last_download_path: str | None = None
         self._record_process: QProcess | None = None
@@ -1017,6 +1028,15 @@ class MainWindow(QMainWindow):
                 if source.resolution_hint != "—"
                 else latest.resolution_hint
             ),
+            duration_hint=(
+                source.duration_hint if source.duration_hint != "—" else latest.duration_hint
+            ),
+            codec_hint=(
+                source.codec_hint if source.codec_hint != "—" else latest.codec_hint
+            ),
+            size_hint=(
+                source.size_hint if source.size_hint != "—" else latest.size_hint
+            ),
             protection=(
                 source.protection
                 if source.protection != "—"
@@ -1097,6 +1117,21 @@ class MainWindow(QMainWindow):
                         if source.resolution_hint != "—"
                         else existing.resolution_hint
                     ),
+                    duration_hint=(
+                        source.duration_hint
+                        if source.duration_hint != "—"
+                        else existing.duration_hint
+                    ),
+                    codec_hint=(
+                        source.codec_hint
+                        if source.codec_hint != "—"
+                        else existing.codec_hint
+                    ),
+                    size_hint=(
+                        source.size_hint
+                        if source.size_hint != "—"
+                        else existing.size_hint
+                    ),
                     protection=(
                         source.protection
                         if source.protection != "—"
@@ -1141,6 +1176,18 @@ class MainWindow(QMainWindow):
                                     self._resolution_sort(enriched.resolution_hint),
                                 ),
                             )
+                        if enriched.duration_hint != "—":
+                            self.table.setItem(
+                                row, self.DURATION_COLUMN,
+                                SortItem(enriched.duration_hint, self._duration_sort(enriched.duration_hint)),
+                            )
+                        if enriched.codec_hint != "—":
+                            self.table.setItem(row, self.CODEC_COLUMN, SortItem(enriched.codec_hint))
+                        if enriched.size_hint != "—":
+                            self.table.setItem(
+                                row, self.SIZE_COLUMN,
+                                SortItem(enriched.size_hint, self._size_sort(enriched.size_hint)),
+                            )
                         self.table.setItem(
                             row,
                             self.PROTECTION_COLUMN,
@@ -1162,15 +1209,18 @@ class MainWindow(QMainWindow):
 
         quality = source.quality_hint if source.quality_hint != "—" else "…"
         resolution = source.resolution_hint if source.resolution_hint != "—" else "…"
+        duration = source.duration_hint if source.duration_hint != "—" else "…"
+        codec = source.codec_hint if source.codec_hint != "—" else "…"
+        size = source.size_hint if source.size_hint != "—" else "…"
         protection = source.protection if source.protection != "—" else "—"
 
         values = [
             source.kind,
-            "…",
+            duration,
             quality,
             resolution,
-            "…",
-            "…",
+            codec,
+            size,
             protection,
             source.origin,
             source.url,
@@ -1294,19 +1344,28 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(False)
 
         source = self._source_by_url.get(url)
+        duration = metadata.duration
         quality = metadata.quality
         resolution = metadata.resolution
+        codec = metadata.codec
+        size = metadata.size
         if source is not None:
+            if duration == "—" and source.duration_hint != "—":
+                duration = source.duration_hint
             if quality == "—" and source.quality_hint != "—":
                 quality = source.quality_hint
             if resolution == "—" and source.resolution_hint != "—":
                 resolution = source.resolution_hint
+            if codec == "—" and source.codec_hint != "—":
+                codec = source.codec_hint
+            if size == "—" and source.size_hint != "—":
+                size = source.size_hint
 
-        self.table.setItem(row, self.DURATION_COLUMN, SortItem(metadata.duration, self._duration_sort(metadata.duration)))
+        self.table.setItem(row, self.DURATION_COLUMN, SortItem(duration, self._duration_sort(duration)))
         self.table.setItem(row, self.QUALITY_COLUMN, SortItem(quality, self._quality_sort(quality)))
         self.table.setItem(row, self.RESOLUTION_COLUMN, SortItem(resolution, self._resolution_sort(resolution)))
-        self.table.setItem(row, self.CODEC_COLUMN, SortItem(metadata.codec))
-        self.table.setItem(row, self.SIZE_COLUMN, SortItem(metadata.size, self._size_sort(metadata.size)))
+        self.table.setItem(row, self.CODEC_COLUMN, SortItem(codec))
+        self.table.setItem(row, self.SIZE_COLUMN, SortItem(size, self._size_sort(size)))
         if source is not None:
             self.table.setItem(row, self.PROTECTION_COLUMN, SortItem(source.protection))
 
@@ -1406,7 +1465,7 @@ class MainWindow(QMainWindow):
     def _size_sort(value: str) -> float:
         if not value or value == "—":
             return -1.0
-        parts = value.split()
+        parts = value.removeprefix("≈").strip().split()
         if len(parts) != 2:
             return -1.0
         try:
@@ -1950,8 +2009,6 @@ class MainWindow(QMainWindow):
             return
 
         self._download_destination = destination
-        self._download_temp_path = temporary_download_path(destination)
-        self._download_destination_existed_before = Path(destination).exists()
         self._download_cancel_requested = False
 
         self._download_dialog = QProgressDialog(
@@ -2000,27 +2057,6 @@ class MainWindow(QMainWindow):
             self._download_dialog.setCancelButton(None)
 
         self._download_thread.requestInterruption()
-
-    def _cleanup_current_download_files(self) -> None:
-        temp_path = self._download_temp_path
-        if temp_path is not None:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-        if (
-            self._download_cancel_requested
-            and self._download_destination
-            and not self._download_destination_existed_before
-        ):
-            target = Path(self._download_destination)
-            # Normally the final target is never created before a successful
-            # validation/rename. This is an extra safeguard for cancellation.
-            try:
-                target.unlink(missing_ok=True)
-            except OSError:
-                pass
 
     @staticmethod
     def _format_bytes(value: object) -> str:
@@ -2146,10 +2182,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _download_failed(self, message: str) -> None:
-        cancelled = message == "Descarga cancelada." or self._download_cancel_requested
-
-        if cancelled:
-            self._cleanup_current_download_files()
+        cancelled = message == "Descarga cancelada."
 
         if self._download_dialog is not None:
             self._download_dialog.close()
@@ -2159,7 +2192,7 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("Cerrando…")
             else:
                 self.status_label.setText(
-                    "Descarga cancelada. Se eliminó el archivo parcial de este intento."
+                    "Descarga cancelada. Se descartó el archivo temporal de este intento."
                 )
             return
 
@@ -2172,8 +2205,6 @@ class MainWindow(QMainWindow):
         self._download_worker = None
         self._download_dialog = None
         self._download_destination = None
-        self._download_temp_path = None
-        self._download_destination_existed_before = False
         self._download_cancel_requested = False
 
     @Slot()

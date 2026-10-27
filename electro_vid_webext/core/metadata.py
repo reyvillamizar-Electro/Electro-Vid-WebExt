@@ -42,6 +42,27 @@ def _format_size(size_bytes: int | None) -> str:
     return "—"
 
 
+def _codec_label(value: str) -> str:
+    codec = value.lower()
+    if codec.startswith(("avc1", "avc3", "h264")):
+        return "H.264 / AVC"
+    if codec.startswith(("hev1", "hvc1", "hevc", "h265")):
+        return "H.265 / HEVC"
+    if codec.startswith(("av01", "av1")):
+        return "AV1"
+    if codec.startswith(("vp09", "vp9")):
+        return "VP9"
+    if codec.startswith(("vp08", "vp8")):
+        return "VP8"
+    if codec == "mpeg4":
+        return "MPEG-4"
+    if codec == "mpeg2video":
+        return "MPEG-2"
+    if codec == "theora":
+        return "Theora"
+    return codec.upper() if codec and codec != "none" else "—"
+
+
 def _quality_label(width: int | None, height: int | None) -> str:
     if not width or not height:
         return "—"
@@ -186,24 +207,13 @@ def _probe_with_ffprobe(
     quality = "—"
     codec = "—"
 
-    codec_labels = {
-        "h264": "H.264 / AVC",
-        "hevc": "H.265 / HEVC",
-        "av1": "AV1",
-        "vp9": "VP9",
-        "vp8": "VP8",
-        "mpeg4": "MPEG-4",
-        "mpeg2video": "MPEG-2",
-        "theora": "Theora",
-    }
-
     for stream in data.get("streams", []):
         if stream.get("codec_type") != "video":
             continue
 
         codec_name = str(stream.get("codec_name") or "").lower()
         if codec_name:
-            codec = codec_labels.get(codec_name, codec_name.upper())
+            codec = _codec_label(codec_name)
 
         width = stream.get("width")
         height = stream.get("height")

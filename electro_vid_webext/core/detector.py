@@ -33,6 +33,9 @@ class VideoSource:
     origin_header: str | None = None
     quality_hint: str = "—"
     resolution_hint: str = "—"
+    duration_hint: str = "—"
+    codec_hint: str = "—"
+    size_hint: str = "—"
     protection: str = "—"
     backend: str = "generic"
     extractor_key: str | None = None
