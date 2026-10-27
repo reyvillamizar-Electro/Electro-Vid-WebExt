@@ -41,9 +41,9 @@ class BrowserView(QWidget):
         title = QLabel("Navegador: Microsoft Edge WebView2")
         title.setStyleSheet("font-size: 18px; font-weight: 600;")
         self._status = QLabel(
-            "Al analizar una URL se abrirá una ventana WebView2 separada. "
-            "Esa ventana reproduce H.264/AAC de forma nativa y las fuentes "
-            "detectadas regresan automáticamente a Resultados."
+            "Al analizar una URL, WebView2 se abrirá minimizado en la barra de tareas. "
+            "Puedes restaurarlo y maximizarlo manualmente cuando necesites interactuar. "
+            "Las fuentes detectadas regresan automáticamente a Resultados."
         )
         self._status.setWordWrap(True)
         self._current_label = QLabel("Sin página cargada.")
@@ -87,7 +87,8 @@ class BrowserView(QWidget):
         self._current_url = url
         self._current_label.setText(f"WebView2: {url}")
         self._status.setText(
-            "Abriendo WebView2… interactúa con la ventana del navegador. "
+            "Abriendo WebView2 minimizado… Restáuralo desde la barra de tareas "
+            "cuando necesites interactuar con el reproductor. "
             "Los reproductores embebidos y HLS se detectarán automáticamente."
         )
 
@@ -187,8 +188,9 @@ class BrowserView(QWidget):
 
         if event_type == "ready":
             self._status.setText(
-                "WebView2 activo. Los popups y redirecciones publicitarias "
-                "se interceptan; las fuentes multimedia vuelven a Resultados."
+                "WebView2 activo. La ventana se inicia minimizada; puedes restaurarla "
+                "desde la barra de tareas. Se interceptan popups y redirecciones "
+                "publicitarias; las fuentes multimedia vuelven a Resultados."
             )
             self.page_ready.emit()
             return

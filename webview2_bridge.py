@@ -1078,7 +1078,7 @@ def main() -> int:
     window = webview.create_window(
         "Electro Vid-WebExt · WebView2",
         url=initial_url,
-        maximized=True,
+        minimized=True,
         resizable=True,
         text_select=True,
         confirm_close=False,
